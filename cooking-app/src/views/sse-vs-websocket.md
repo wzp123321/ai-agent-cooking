@@ -300,7 +300,108 @@ HTTP Upgrade 握手成功后，协议从 HTTP 切换为 WebSocket，Express/Koa 
 
 ---
 
-## 八、总结
+## 八、SSE 与人机协作（交互式工具）
+
+### 8.1 场景引入
+
+厨神小助不仅会"自问自答"，LLM 还会**主动把决策权交回用户**——比如询问"你想做川菜还是粤菜？"。这就是人机协作（Human-in-the-Loop），需要 SSE 流能够**中途暂停**，等用户选择后再**续点**继续生成。
+
+### 8.2 SSE 协议扩展
+
+SSE 的 `event:` 字段天然支持自定义事件类型，因此新增 1 种事件即可支持交互：
+
+```
+event: chunk                # LLM 输出 token（原有）
+data: {"content": "好的，川菜口味偏重…"}
+
+event: interactive_request  # ← 新增：交互式工具触发
+data: {"interactiveId": "tool_call_xxx", "question": "想做哪种菜系？", "options": ["川菜","粤菜"], "multiSelect": false}
+
+event: done                 # 流正常结束（原有）
+data: {"content": "完整回答", "sessionId": "abc123"}
+```
+
+收到 `interactive_request` 事件后，SSE 连接由服务端 `res.end()` 关闭，前端展示选项卡片。用户点击后调用新的 `POST /api/chat/continue` 端点，**开新流**继续生成。
+
+### 8.3 为什么 SSE 比 WebSocket 更适合此场景
+
+| | SSE（开新流） | WebSocket（双工消息） |
+|------|---------------|---------------------|
+| **协议复杂度** | 多一个 `/api/chat/continue` HTTP 端点 | 在同一通道里发 JSON 消息 |
+| **状态管理** | sessionId 决定续点归属，状态机清晰 | 需要在 WS 服务器内维护"等待用户输入"标记 |
+| **断线恢复** | 浏览器/代理重连后用 sessionId 重新调 `/continue` | 需手动实现重连、消息去重、断点续传 |
+| **HTTP 生态** | 复用 fetch / 中间件 / 限流 / 鉴权 | 需在 ws 框架里重新实现 |
+| **服务端实现成本** | `agent.resumeInteractive()` 与 `chatStream` 共享循环 | 需引入"消息分发器" |
+| **是否需要长连接** | ❌ 流结束即释放 | ✅ 长连接保活（心跳、断线检测） |
+
+**核心结论：** 交互式工具是"半双工"模型——服务端暂停后等用户输入，**此时并不需要双向通信**。SSE 在"暂停 → 续点"的两段式流程里表现更优，状态完全无状态化（sessionId 决定上下文）。
+
+### 8.4 完整的端到端时序
+
+```
+┌─────────┐                       ┌─────────┐                  ┌─────────┐
+│ 浏览器  │                       │ Express │                  │  Agent  │
+└────┬────┘                       └────┬────┘                  └────┬────┘
+     │  POST /api/chat/stream          │                             │
+     │─────────────────────────────────>                             │
+     │                                │  chatStream()                │
+     │  event: chunk ...              │────────────────────────────>│
+     │<────────────────────────────────│                             │
+     │  event: interactive_request    │  onInteractive()             │
+     │    { interactiveId, options }  │<────────────────────────────│
+     │<────────────────────────────────│  res.end()                   │
+     │                                │                              │
+     │  (SSE 关闭)                     │                              │
+     │  POST /api/chat/continue        │                              │
+     │    { sessionId, choice }        │  resumeInteractive()         │
+     │─────────────────────────────────>────────────────────────────>│
+     │  event: chunk ...              │                              │
+     │<────────────────────────────────│                              │
+     │  event: done                   │  onDone()                    │
+     │<────────────────────────────────│                              │
+```
+
+### 8.5 与 WebSocket 实现对比
+
+如果改用 WebSocket 实现同样的人机协作，需要：
+
+```typescript
+// 伪代码：WS 实现
+wss.on('connection', (ws) => {
+  ws.on('message', async (data) => {
+    const msg = JSON.parse(data)
+    if (msg.type === 'user_message') {
+      const stream = agent.chatStream(msg.text, msg.sessionId, {
+        onInteractive(req) {
+          ws.send(JSON.stringify({ type: 'interactive_request', payload: req }))
+          // 注意：此时连接还活着，要进入"等待"状态
+          ws._waitingForChoice = req.id  // 状态标记
+        },
+      })
+    }
+    if (msg.type === 'user_choice') {
+      // 检测到上一轮是等待状态？
+      if (ws._waitingForChoice === msg.interactiveId) {
+        agent.resumeInteractive(ws._sessionId, msg.interactiveId, msg.choice, ...)
+        ws._waitingForChoice = null
+      }
+    }
+  })
+})
+```
+
+**对比 SSE 方案：**
+
+- 多了"连接内状态"——服务端需追踪"当前是否在等用户"
+- 消息需要 `type` 字段区分（chunk/choice/...）
+- 续点失败时需要清理状态，超时/重连都要处理
+- 部署需配 Nginx `Upgrade` 头，处理 `wss://` 证书
+
+**结论：** 当交互式是"低频"且"段落式"时（用户在 AI 完成一段生成后才选），SSE 方案显著更简洁；只有"高频双向"（语音、协作编辑）才值得上 WebSocket。
+
+---
+
+## 九、总结
 
 | | SSE | WebSocket |
 |------|-----|-----------|
@@ -311,3 +412,6 @@ HTTP Upgrade 握手成功后，协议从 HTTP 切换为 WebSocket，Express/Koa 
 | **本项目适用度** | ⭐⭐⭐⭐⭐ 模型天然匹配 | ⭐ 能力溢出、部署成本高 |
 | **前端依赖** | 零（本项目用 fetch） | socket.io ~15KB |
 | **后端改动** | 无（Express 原生支持） | 需引入 ws/socket.io 库 |
+| **交互式工具** | ✅ `/api/chat/continue` 开新流，无状态化 | ⚠️ 需维护"等待用户输入"标记 |
+| **续点实现** | 共享 `agent.resumeInteractive()` | 需在 WS 分发器里手写恢复逻辑 |
+| **断线恢复** | sessionId 兜底，前端重调即可 | 需消息序号 + 状态机 |

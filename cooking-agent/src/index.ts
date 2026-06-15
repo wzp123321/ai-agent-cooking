@@ -34,7 +34,7 @@ import { CookingAgent } from './agent'
 import { runMigrations } from './db/migrate'
 import { userProfileRepo } from './db/user-profile.repository'
 import { analyzeImage } from './vision'
-import type { ChatRequestBody } from './types'
+import type { ChatRequestBody, ContinueRequestBody } from './types'
 
 // ─── Express 应用初始化 ────────────────────────────────────
 
@@ -331,6 +331,23 @@ app.post(
           }
         },
         abortController.signal,
+        // 交互式工具触发：把 InteractiveRequest 序列化为 SSE 事件，
+        // 前端拿到后渲染可点击按钮，等待用户选完调 /api/chat/continue。
+        // 这里不调 res.end()，由 agent 内部在 paused=true 时跳出，
+        // 跳到 try 块之后，外层 onDone 不会被调用，所以连接会自然挂起；
+        // 为了让客户端能立即收尾，我们显式 end 一次。
+        (interactiveReq) => {
+          hasStreamed = true
+          if (!res.writableEnded) {
+            console.info(`[Route] 🙋 SSE [${sessionId}] 下发交互式请求：${interactiveReq.question}`)
+            sendEvent('interactive_request', {
+              interactiveId: interactiveReq.id,
+              question: interactiveReq.question,
+              options: interactiveReq.options,
+              multiSelect: interactiveReq.multiSelect,
+            })
+          }
+        },
       )
     } catch (err) {
       finished = true
@@ -339,6 +356,123 @@ app.post(
         sendEvent('error', { error: (err as Error).message })
         res.end()
       }
+    }
+
+    // 因交互式工具暂停：agent 不调 onDone，需要 route 主动结束 SSE，
+    // 让前端可以正常监听 interactive_request 事件。
+    if (!finished && !res.writableEnded) {
+      console.info(`[Route] ⏸️  SSE [${sessionId}] 因交互式工具暂停，关闭连接`)
+      res.end()
+    }
+  },
+)
+
+/**
+ * POST /api/chat/continue
+ * ────────────────────────────────────────────────────────────
+ * 恢复被交互式工具暂停的 SSE 流。
+ *
+ * 触发场景：用户在 /api/chat/stream 的 SSE 流中收到 interactive_request 事件，
+ *          在前端点击选项后调用此端点。
+ *
+ * 请求 Body：
+ *   {
+ *     "sessionId":     "xxx",
+ *     "interactiveId": "tool_call_id_xxx",  // 上一轮 ask_user_choice 的 ID
+ *     "choice":        ["减脂"]              // 始终是数组，单选时只有一个元素
+ *   }
+ *
+ * 返回：与 /api/chat/stream 同样的 SSE 流（chunk / done / error / interactive_request）
+ *
+ * 协议设计说明：
+ *   - 选择"新建 SSE 流"而非"复用旧流"：旧流已经在 interactive_request 后被关闭，
+ *     浏览器侧无法通过 EventSource 直接 attach 回去；
+ *     改为新开一条 SSE，行为对前端完全一致（onChunk / onDone / onInteractiveRequest 复用）。
+ */
+app.post(
+  '/api/chat/continue',
+  async (req: Request<object, object, ContinueRequestBody>, res: Response) => {
+    const { sessionId = 'default', interactiveId, choice } = req.body
+
+    console.info(`[Route] POST /api/chat/continue [${sessionId}] 恢复 interactiveId=${interactiveId}`)
+
+    // ── 参数校验 ──
+    if (!interactiveId || typeof interactiveId !== 'string') {
+      res.status(400).json({ error: '请提供有效的 interactiveId' })
+      return
+    }
+    if (!Array.isArray(choice) || choice.length === 0) {
+      res.status(400).json({ error: '请提供至少一个 choice' })
+      return
+    }
+
+    // ── 设置 SSE 响应头（与 /api/chat/stream 一致） ──
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders()
+
+    const sendEvent = (event: string, data: object): void => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    }
+
+    const abortController = new AbortController()
+    let finished = false
+    let hasStreamed = false
+
+    req.on('close', () => {
+      if (!finished && !res.writableEnded && hasStreamed) {
+        console.info(`[Route] 🔌 continue [${sessionId}] 客户端断开，触发中止`)
+        abortController.abort()
+      }
+    })
+
+    try {
+      await agent.resumeInteractive(
+        sessionId,
+        interactiveId,
+        choice,
+        (chunk) => {
+          hasStreamed = true
+          if (!res.writableEnded) {
+            sendEvent('chunk', { content: chunk })
+          }
+        },
+        (full) => {
+          finished = true
+          if (!res.writableEnded) {
+            sendEvent('done', { content: full, sessionId, finish_reason: 'stop' })
+            console.info(`[Route] ✅ continue [${sessionId}] 恢复完成`)
+            res.end()
+          }
+        },
+        (interactiveReq) => {
+          hasStreamed = true
+          if (!res.writableEnded) {
+            console.info(`[Route] 🙋 continue [${sessionId}] 又遇到交互式工具：${interactiveReq.question}`)
+            sendEvent('interactive_request', {
+              interactiveId: interactiveReq.id,
+              question: interactiveReq.question,
+              options: interactiveReq.options,
+              multiSelect: interactiveReq.multiSelect,
+            })
+          }
+        },
+        abortController.signal,
+      )
+    } catch (err) {
+      finished = true
+      console.error(`[Route] ❌ continue [${sessionId}] 失败：${(err as Error).message}`)
+      if (!res.writableEnded) {
+        sendEvent('error', { error: (err as Error).message })
+        res.end()
+      }
+    }
+
+    if (!finished && !res.writableEnded) {
+      console.info(`[Route] ⏸️  continue [${sessionId}] 因再次暂停，关闭连接`)
+      res.end()
     }
   },
 )

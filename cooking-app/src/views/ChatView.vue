@@ -100,7 +100,7 @@
  *   - 移动端响应式（侧边栏 drawer 切换）
  *   - 提供"清空对话"的事件处理
  */
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, provide } from 'vue'
 import { Menu, Delete, Setting } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import SidebarPanel from '@/components/SidebarPanel.vue'
@@ -108,9 +108,20 @@ import MessageList from '@/components/MessageList.vue'
 import InputBar from '@/components/InputBar.vue'
 import ProfileSettings from '@/components/ProfileSettings.vue'
 import { useChatStore } from '@/stores/chat'
+import { useConversation } from '@/hooks'
 import { APP_NAME, APP_DESC } from '@/constants'
 
 const chatStore = useChatStore()
+
+/**
+ * useConversation 在 ChatView 顶层调用一次（保持单一实例），
+ * 把 submitInteractiveChoice 通过 provide/inject 暴露给 MessageList → MessageBubble，
+ * 避免每个组件各自调用 hook 导致 abortController 状态被反复重置。
+ *
+ * 这是一个 Vue 3 的"上下文桥"模式，比 props 透传更简洁。
+ */
+const { submitInteractiveChoice } = useConversation()
+provide('submitInteractiveChoice', submitInteractiveChoice)
 
 onMounted(() => {
   chatStore.loadSessions()

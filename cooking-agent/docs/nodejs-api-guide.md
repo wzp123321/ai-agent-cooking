@@ -29,23 +29,28 @@
 cooking-agent/
 ├── src/
 │   ├── index.ts              # 入口文件：Express 服务启动、路由注册
-│   ├── agent.ts              # Agent 核心类（业务逻辑）
-│   ├── types.ts              # 全局类型定义
+│   ├── agent.ts              # Agent 核心类（业务逻辑）含 chat / chatStream / resumeInteractive
+│   ├── types.ts              # 全局类型定义（含 ContinueRequestBody）
 │   ├── prompts.ts            # 系统提示词构建
 │   ├── loader.ts             # Skill 文件加载器
 │   ├── db/
 │   │   ├── index.ts          # 数据库连接管理（单例）
 │   │   ├── migrate.ts        # 数据库迁移（建表/加列）
 │   │   ├── session.repository.ts  # 会话数据访问层
-│   │   └── message.repository.ts  # 消息数据访问层
+│   │   ├── message.repository.ts  # 消息数据访问层
+│   │   └── user-profile.repository.ts # 用户画像
 │   └── tools/
-│       ├── index.ts          # 工具注册表 + 执行调度
+│       ├── index.ts          # 工具注册表 + 执行调度（含 INTERACTIVE_TOOL_NAMES）
 │       ├── types.ts          # 工具体系类型定义
 │       ├── recipe.ts         # 菜谱查询工具
 │       ├── nutrition.ts      # 营养计算工具
 │       ├── safety.ts         # 食品安全工具
 │       ├── technique.ts      # 烹饪技法工具
-│       └── suggest.ts        # 菜品推荐工具
+│       ├── suggest.ts        # 菜品推荐工具
+│       ├── substitute.ts     # 食材替换工具
+│       ├── diet.ts           # 膳食模式适配工具
+│       ├── knowledge.ts      # RAG 知识检索工具
+│       └── ask-user.ts       # 交互式工具（人机协作入口）
 ├── skills/                   # Skill 定义（.md 文件）
 │   ├── recipe.md
 │   ├── nutrition.md
@@ -165,9 +170,13 @@ cors() → express.json() → 路由 → 404处理 → 全局错误处理
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/api/chat` | 普通对话（非流式） |
 | `POST` | `/api/chat/stream` | 流式对话（SSE） |
+| `POST` | `/api/chat/continue` | 续点：恢复被交互式工具暂停的 SSE 流 |
+| `POST` | `/api/vision/chat` | 图片识别对话 |
 | `GET` | `/api/sessions` | 获取会话列表 |
 | `GET` | `/api/history/:sessionId` | 获取对话历史 |
 | `DELETE` | `/api/session/:sessionId` | 清除会话 |
+| `GET` | `/api/profile` | 获取用户画像 |
+| `PUT` | `/api/profile` | 更新用户画像 |
 
 ### 5.2 路由编写规范
 
@@ -218,9 +227,24 @@ data: {"content": "你好"}
 
 event: done
 data: {"content": "完整文本", "sessionId": "xxx"}
+
+event: interactive_request
+data: {"interactiveId": "tool_call_xxx", "question": "...", "options": ["A","B"], "multiSelect": false}
+
+event: error
+data: {"error": "错误描述"}
 ```
 
 每条消息以 `\n\n` 结尾作为分隔符。
+
+**事件类型一览：**
+
+| 事件 | data 字段 | 触发时机 |
+|------|----------|---------|
+| `chunk` | `{ content: string }` | LLM 输出每个 token |
+| `done` | `{ content, sessionId, finish_reason? }` | 流正常结束 |
+| `interactive_request` | `{ interactiveId, question, options, multiSelect }` | LLM 调用 ask_user_choice |
+| `error` | `{ error: string }` | LLM/工具/SSE 异常 |
 
 ### 6.2 完整实现
 
@@ -246,18 +270,56 @@ app.post('/api/chat/stream', async (req, res) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   }
 
+  // 中止信号
+  const abortController = new AbortController()
+  let finished = false
+  let hasStreamed = false
+
+  req.on('close', () => {
+    if (!finished && !res.writableEnded && hasStreamed) {
+      abortController.abort()
+    }
+  })
+
   try {
     await agent.chatStream(
       message,
       sessionId,
-      (chunk) => sendEvent('chunk', { content: chunk }),
+      (chunk) => {
+        hasStreamed = true
+        if (!res.writableEnded) sendEvent('chunk', { content: chunk })
+      },
       (full) => {
-        sendEvent('done', { content: full, sessionId })
-        res.end()
+        finished = true
+        if (!res.writableEnded) {
+          sendEvent('done', { content: full, sessionId })
+          res.end()
+        }
+      },
+      abortController.signal,
+      // 交互式工具触发：下发 interactive_request 事件后由路由主动 res.end()
+      (interactiveReq) => {
+        hasStreamed = true
+        if (!res.writableEnded) {
+          sendEvent('interactive_request', {
+            interactiveId: interactiveReq.id,
+            question:     interactiveReq.question,
+            options:      interactiveReq.options,
+            multiSelect:  interactiveReq.multiSelect,
+          })
+        }
       },
     )
   } catch (err) {
-    sendEvent('error', { error: (err as Error).message })
+    finished = true
+    if (!res.writableEnded) {
+      sendEvent('error', { error: (err as Error).message })
+      res.end()
+    }
+  }
+
+  // 因交互式工具暂停：agent 不调 onDone，路由主动结束 SSE
+  if (!finished && !res.writableEnded) {
     res.end()
   }
 })
@@ -273,6 +335,8 @@ app.post('/api/chat/stream', async (req, res) => {
 | **`res.end()`** | 流结束后必须调用，否则连接不会释放 |
 | **错误也要 `res.end()`** | catch 块中发送 error 事件后也要 end，否则连接泄漏 |
 | **`\n\n` 分隔符** | 必须严格两个换行，否则客户端解析失败 |
+| **交互式暂停要 `res.end()`** | agent 因 `paused=true` 不调 `onDone`，路由必须主动关闭 |
+| **三标记防误关闭** | `finished` / `hasStreamed` / `writableEnded` 配合，区分正常完成 / 客户端断开 / 已结束 |
 
 ### 6.4 前端接收 SSE
 
@@ -289,10 +353,186 @@ eventSource.addEventListener('done', (e) => {
   eventSource.close()
 })
 
+eventSource.addEventListener('interactive_request', (e) => {
+  const req = JSON.parse(e.data)
+  // 弹出选项卡片 / 渲染单选组件
+  // 用户点击后调 POST /api/chat/continue
+})
+
 eventSource.addEventListener('error', (e) => {
   eventSource.close()
 })
 ```
+
+### 6.5 续点端点 `/api/chat/continue`
+
+当 SSE 流因 `interactive_request` 事件被关闭后，前端在用户完成选择后调用此端点开新流继续生成。
+
+**请求：**
+
+```http
+POST /api/chat/continue
+Content-Type: application/json
+
+{
+  "sessionId": "abc123",
+  "interactiveId": "tool_call_xxx",
+  "choice": ["川菜"]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `sessionId` | `string` | ❌ | 会话 ID，默认 `'default'` |
+| `interactiveId` | `string` | ✅ | LLM 下发的 tool_call.id，与 interactive_request 事件的 interactiveId 一致 |
+| `choice` | `string[]` | ✅ | 用户选择的选项（多选时为多个元素） |
+
+**响应（SSE 流）：**
+
+```
+event: chunk
+data: {"content":"好，川菜口味偏重…"}
+
+event: done
+data: {"content":"完整回答","sessionId":"abc123"}
+```
+
+事件类型与 `/api/chat/stream` 完全一致（`chunk` / `done` / `interactive_request` / `error`），**但 `interactive_request` 可能再触发**——一次会话中可连续多次追问。
+
+**完整实现：**
+
+```typescript
+interface ContinueRequestBody {
+  sessionId?: string
+  interactiveId: string
+  choice: string[]
+}
+
+app.post(
+  '/api/chat/continue',
+  async (req: Request<object, object, ContinueRequestBody>, res: Response) => {
+    const { sessionId = 'default', interactiveId, choice } = req.body
+
+    // 参数校验
+    if (!interactiveId || typeof interactiveId !== 'string') {
+      res.status(400).json({ error: '请提供有效的 interactiveId' })
+      return
+    }
+    if (!Array.isArray(choice) || choice.length === 0) {
+      res.status(400).json({ error: '请提供至少一个 choice' })
+      return
+    }
+
+    // 同样的 SSE 头
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders()
+
+    const sendEvent = (event: string, data: object) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    }
+
+    const abortController = new AbortController()
+    let finished = false
+
+    req.on('close', () => {
+      if (!finished && !res.writableEnded) abortController.abort()
+    })
+
+    try {
+      await agent.resumeInteractive(
+        sessionId,
+        interactiveId,
+        choice,
+        (chunk) => { if (!res.writableEnded) sendEvent('chunk', { content: chunk }) },
+        (full) => {
+          finished = true
+          if (!res.writableEnded) {
+            sendEvent('done', { content: full, sessionId })
+            res.end()
+          }
+        },
+        (interactiveReq) => {
+          if (!res.writableEnded) {
+            sendEvent('interactive_request', {
+              interactiveId: interactiveReq.id,
+              question:     interactiveReq.question,
+              options:      interactiveReq.options,
+              multiSelect:  interactiveReq.multiSelect,
+            })
+          }
+        },
+        abortController.signal,
+      )
+    } catch (err) {
+      finished = true
+      if (!res.writableEnded) {
+        sendEvent('error', { error: (err as Error).message })
+        res.end()
+      }
+    }
+
+    if (!finished && !res.writableEnded) res.end()
+  },
+)
+```
+
+**关键注意事项：**
+
+| 要点 | 说明 |
+|------|------|
+| **`interactiveId` 必须来自 LLM** | 不允许前端生成；找不到对应 tool_call → 500 + "会话可能已过期" |
+| **`choice` 数组保证非空** | 多选模式必须传全部选项；空数组 → 400 拦截 |
+| **SSE 头与 chat/stream 一致** | 前端 fetch 解析逻辑可复用 |
+| **续点仍可能再触发交互** | 一次会话支持连续多轮人机协作 |
+| **不持久化 user 角色消息** | `role=tool` 消息由 agent 内部写入，POST 请求体只传选择 |
+
+### 6.6 端到端时序
+
+```
+┌─────────┐                                ┌─────────┐                ┌─────────┐
+│ 浏览器  │                                │ Express │                │  Agent  │
+└────┬────┘                                └────┬────┘                └────┬────┘
+     │  POST /api/chat/stream { message }       │                            │
+     │──────────────────────────────────────────>│                            │
+     │                                           │  agent.chatStream(        │
+     │                                           │     onChunk, onDone,      │
+     │                                           │     onInteractive)        │
+     │                                           │───────────────────────────>│
+     │                                           │                            │
+     │  event: chunk { content: "思考" }         │                            │
+     │<──────────────────────────────────────────│                            │
+     │  event: chunk { content: "中..." }        │                            │
+     │<──────────────────────────────────────────│                            │
+     │  event: interactive_request              │                            │
+     │    { interactiveId, question, options }   │                            │
+     │<──────────────────────────────────────────│  onInteractive()           │
+     │  (SSE 关闭)                              │──────> res.end()            │
+     │                                           │                            │
+     │  POST /api/chat/continue                 │                            │
+     │    { sessionId, interactiveId, choice }   │                            │
+     │──────────────────────────────────────────>│  agent.resumeInteractive(  │
+     │                                           │     ...onInteractive)      │
+     │                                           │───────────────────────────>│
+     │  event: chunk ...                         │                            │
+     │<──────────────────────────────────────────│                            │
+     │  event: done { content, sessionId }       │                            │
+     │<──────────────────────────────────────────│  onDone() → res.end()      │
+     │                                           │                            │
+```
+
+### 6.7 错误码与提示
+
+| 场景 | 状态码 | 错误信息 |
+|------|--------|----------|
+| 缺少 `interactiveId` | 400 | 请提供有效的 interactiveId |
+| `choice` 数组为空 | 400 | 请提供至少一个 choice |
+| 找不到对应 tool_call | 500 | 会话可能已过期，请重新发起对话 |
+| 加载会话历史失败 | 500 | 加载历史消息失败（具体错误） |
+| 解析 interactive 参数失败 | 500 | 内部参数错误（参数已被 LLM 修改） |
+| LLM 持续出错 | 500 | （LLM 错误描述） |
 
 ---
 
@@ -680,6 +920,18 @@ dist/
 - [ ] 设置 `X-Accel-Buffering: no`（Nginx 场景）
 - [ ] 错误和正常结束都要调用 `res.end()`
 - [ ] 消息以 `\n\n` 结尾
+- [ ] 交互式工具触发时下发 `interactive_request` 事件后**主动 `res.end()`**
+- [ ] `/api/chat/continue` 端点校验 `interactiveId` 和非空 `choice`
+- [ ] 续点 SSE 头与 `chat/stream` 完全一致，前端可复用同一解析器
+- [ ] 用 `finished` / `hasStreamed` / `writableEnded` 三标记防 `req.on('close')` 误关闭
+
+### 交互式工具
+
+- [ ] 所有交互式工具在 `INTERACTIVE_TOOL_NAMES` 中登记
+- [ ] 工具 `options` 长度 2-4，`description` 强调调用场景
+- [ ] `multiSelect` 默认 false，前端多选 UI 需明确勾选
+- [ ] 服务端不缓存 `interactive_request`，全部来自 LLM tool_call 解析
+- [ ] 用户选择超出 `options` 范围时拒绝（前端校验 + 后端信任 LLM 输出）
 
 ### 数据库
 

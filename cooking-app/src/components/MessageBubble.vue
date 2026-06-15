@@ -25,6 +25,30 @@
         </template>
         <template v-else>
           <!--
+            工具调用列表 — 当 finish_reason='tool_calls' 时渲染
+            每个工具调用以可展开卡片形式展示：
+              - 头部：🔧 工具名 + 参数摘要（默认折叠）
+              - 展开后：完整 JSON 参数
+              - 流式聚合中显示"调用中…"动效
+          -->
+          <div v-if="message.toolCalls && message.toolCalls.length > 0" class="tool-calls">
+            <div
+              v-for="(tc, i) in message.toolCalls"
+              :key="tc.id || i"
+              class="tool-call"
+              :class="{ expanded: expandedTools[i], 'is-streaming': message.streaming && !message.content }"
+            >
+              <button class="tool-call-header" @click="toggleTool(i)" type="button">
+                <span class="tool-icon">🔧</span>
+                <span class="tool-name">{{ tc.function.name || '调用中…' }}</span>
+                <span v-if="message.streaming && !message.content" class="tool-streaming">调用中…</span>
+                <span v-else class="tool-summary">{{ summarizeArgs(tc.function.arguments) }}</span>
+                <span class="tool-toggle">{{ expandedTools[i] ? '▾' : '▸' }}</span>
+              </button>
+              <pre v-if="expandedTools[i]" class="tool-args">{{ formatArgs(tc.function.arguments) }}</pre>
+            </div>
+          </div>
+          <!--
             思考中指示器 — AI 开始生成但尚无内容时的过渡 UI
               显示 "思考中" 文字 + 三个弹跳点动画
               每个点的动画错开 0.2s，产生波浪式弹跳效果
@@ -38,6 +62,25 @@
           </div>
           <div v-if="message.content" class="markdown-body" v-html="renderedContent" />
           <span v-if="message.streaming && message.content" class="typing-cursor" />
+          <!--
+            交互式工具请求（ask_user_choice） — 范式 B
+            渲染位置：在主内容之后，不打乱已有的 markdown 区域。
+            状态机：
+              pending  (!interactiveResolved) : 渲染可点击按钮/复选框
+              resolved ( interactiveResolved) : 替换为 "已选择: X" 灰字提示
+            多选模式：每个选项独立复选框，"提交" 按钮始终可点；
+                    至少勾选一项才能提交。
+            单选模式：点击即提交，无需额外按钮。
+            提交中：禁用所有按钮，避免重复点击。
+          -->
+          <InteractiveChoiceCard
+            v-if="message.interactive"
+            :request="message.interactive"
+            :resolved="!!message.interactiveResolved"
+            :choice="message.interactiveChoice"
+            :submitting="isSubmitting"
+            @select="onSelect"
+          />
         </template>
       </div>
     </div>
@@ -47,13 +90,81 @@
 <script setup lang="ts">
 import { computed, ref, watch, onUnmounted } from 'vue'
 import { marked } from 'marked'
+import InteractiveChoiceCard from '@/components/InteractiveChoiceCard.vue'
 import type { ChatMessage } from '@/types'
 
-const props = defineProps<{ message: ChatMessage }>()
+const props = defineProps<{
+  message: ChatMessage
+  submitInteractiveChoice: (id: string, choice: string[]) => Promise<void>
+}>()
+
+// 提交中状态：控制按钮 disabled 状态，避免用户重复点击。
+// 注意：此状态是本地（per-message）的，关闭后会自动重置。
+const isSubmitting = ref(false)
+
+const onSelect = async (choice: string[]): Promise<void> => {
+  if (!props.message.interactive || isSubmitting.value) return
+  isSubmitting.value = true
+  try {
+    await props.submitInteractiveChoice(props.message.interactive.id, choice)
+  } catch (err) {
+    // submitInteractiveChoice 内部已处理错误，这里只是兜底
+    console.error('[MessageBubble] ❌ 提交交互选择失败：', err)
+  } finally {
+    isSubmitting.value = false
+  }
+}
 
 const isThinking = computed(
-  () => props.message.role === 'assistant' && props.message.streaming && !props.message.content,
+  () =>
+    props.message.role === 'assistant' &&
+    props.message.streaming &&
+    !props.message.content &&
+    (!props.message.toolCalls || props.message.toolCalls.length === 0),
 )
+
+// 工具调用展开/折叠状态（按 index 索引）
+const expandedTools = ref<Record<number, boolean>>({})
+const toggleTool = (i: number): void => {
+  expandedTools.value[i] = !expandedTools.value[i]
+}
+
+/**
+ * 解析并格式化工具参数。
+ * 工具参数是 LLM 流式追加的 JSON 字符串，常见问题：
+ *   - 还没追加完：JSON.parse 会抛错
+ *   - 不是合法 JSON：同上
+ *   - 嵌套对象/数组：直接 JSON.stringify 即可
+ * 用 try-catch 兜底，解析失败时返回原始字符串（带类型标注）。
+ */
+const formatArgs = (raw: string): string => {
+  if (!raw) return '(空参数)'
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+}
+
+/**
+ * 工具参数摘要 — 折叠态展示，避免长 JSON 撑爆气泡宽度。
+ * 策略：截取 key/value 拼成简短列表。
+ */
+const summarizeArgs = (raw: string): string => {
+  if (!raw) return ''
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>
+    const parts = Object.entries(obj).map(([k, v]) => {
+      const value = typeof v === 'string' ? v : JSON.stringify(v)
+      const short = value.length > 16 ? value.slice(0, 16) + '…' : value
+      return `${k}=${short}`
+    })
+    return parts.join(' · ')
+  } catch {
+    // 流式追加中 JSON 还不完整时，截前 24 字符作为占位
+    return raw.length > 24 ? raw.slice(0, 24) + '…' : raw
+  }
+}
 
 const renderedContent = ref<string>('')
 let parseTimer: ReturnType<typeof setTimeout> | null = null
@@ -243,6 +354,100 @@ onUnmounted(() => {
 
 .user-text {
   word-break: break-word;
+}
+
+/**
+ * 工具调用卡片样式
+ *   - 卡片：圆角 + 浅灰背景 + 细边框，与气泡形成视觉分层
+ *   - 头部：横向 flex，左侧图标 / 中间名+参数 / 右侧折叠箭头
+ *   - 折叠态：仅显示一行；展开态：pre 块展示完整参数
+ */
+.tool-calls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tool-call {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft, rgba(0, 0, 0, 0.03));
+  overflow: hidden;
+  transition: border-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.tool-call.is-streaming {
+  border-color: var(--accent);
+  animation: toolPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes toolPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.15); }
+}
+
+.tool-call-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.tool-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.tool-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--accent);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+}
+
+.tool-summary {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-streaming {
+  flex: 1;
+  font-size: 12px;
+  color: var(--accent);
+  font-style: italic;
+}
+
+.tool-toggle {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.tool-args {
+  margin: 0;
+  padding: 8px 12px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text);
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
 }
 
 .thinking-indicator {

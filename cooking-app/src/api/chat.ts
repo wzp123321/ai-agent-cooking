@@ -23,7 +23,16 @@
 
 import request from './request'
 import { BASE_URL } from '@/constants'
-import type { ChatResponse, SessionMeta, ChatMessage, UserProfile } from '@/types'
+import type {
+  ChatResponse,
+  SessionMeta,
+  ChatMessage,
+  UserProfile,
+  ToolCall,
+  ToolCallDelta,
+  FinishReason,
+  InteractiveRequest,
+} from '@/types'
 
 // ─── 普通对话 ──────────────────────────────────────────────
 
@@ -55,25 +64,77 @@ export const sendChat = async (message: string, sessionId: string): Promise<Chat
  * 注意：此函数使用原生 fetch 而非 Axios，
  * 因为 Axios 不支持 ReadableStream 流式读取。
  *
- * SSE 事件类型：
- *   - 'chunk'：每个 token 片段到达时触发 → 调用 onChunk
- *   - 'done' ：全部传输结束时触发 → 调用 onDone
- *   - 'error'：后端出错时触发 → 调用 onError
+ * SSE 事件类型（后端约定）：
+ *   - { content }                   : 文本 token 片段 → onChunk
+ *   - { tool_calls: [...] }         : 工具调用增量   → onToolCallDelta
+ *   - { sessionId, finish_reason }  : 流结束         → onDone / onToolCalls
+ *   - { error }                     : 后端错误        → onError
  *
- * @param message   - 用户输入
- * @param sessionId - 会话 ID
- * @param onChunk   - 每次收到 token 片段的回调
- * @param onDone    - 流结束后回调
- * @param onError   - 出错时的回调
- * @param signal    - AbortSignal，用于取消请求
+ * finish_reason 分发规则（OpenAI 协议兼容）：
+ *   - 'stop' / 'length' / 'content_filter' : 调用 onDone（最终文本已包含）
+ *   - 'tool_calls'                         : 调用 onToolCalls（聚合后的完整列表），不调 onDone
+ *   - null / undefined                     : 兜底按 onDone 处理
+ *
+ * 工具调用聚合：
+ *   OpenAI 协议下，工具调用以 delta 形式跨多个 chunk 下发，
+ *   需要按 tool_calls[].index 聚合成完整的 ToolCall[]。
+ *
+ * @param message          - 用户输入
+ * @param sessionId        - 会话 ID
+ * @param onChunk          - 文本片段回调
+ * @param onDone           - 文本流结束回调（仅 finish_reason != 'tool_calls'）
+ * @param onError          - 出错回调
+ * @param signal           - AbortSignal，用于取消请求
+ * @param onToolCallDelta  - 工具调用增量回调（可选，UI 实时显示"正在调用 XX"）
+ * @param onToolCalls      - 工具调用聚合完成回调（可选，finish_reason='tool_calls' 时触发）
+ */
+/**
+ * sendChatStream — 发送流式对话请求（SSE — Server-Sent Events）
+ *
+ * 注意：此函数使用原生 fetch 而非 Axios，
+ * 因为 Axios 不支持 ReadableStream 流式读取。
+ *
+ * SSE 事件类型（后端约定）：
+ *   - { content }                      : 文本 token 片段 → onChunk
+ *   - { tool_calls: [...] }            : 工具调用增量   → onToolCallDelta
+ *   - { interactiveId, question, ... } : 交互式工具请求 → onInteractiveRequest
+ *   - { sessionId, finish_reason }     : 流结束         → onDone / onToolCalls
+ *   - { error }                        : 后端错误        → onError
+ *
+ * finish_reason 分发规则（OpenAI 协议兼容）：
+ *   - 'stop' / 'length' / 'content_filter' : 调用 onDone（最终文本已包含）
+ *   - 'tool_calls'                         : 调用 onToolCalls（聚合后的完整列表），不调 onDone
+ *   - null / undefined                     : 兜底按 onDone 处理
+ *
+ * 工具调用聚合：
+ *   OpenAI 协议下，工具调用以 delta 形式跨多个 chunk 下发，
+ *   需要按 tool_calls[].index 聚合成完整的 ToolCall[]。
+ *
+ * 交互式工具（范式 B）：
+ *   当 LLM 调起 ask_user_choice 时，agent 不调 onDone 而是先发 interactive_request。
+ *   收到此事件后调用方应渲染按钮，**不**重启流。
+ *   用户选择后调用 continueInteractive() 重新开启流。
+ *
+ * @param message                 - 用户输入
+ * @param sessionId               - 会话 ID
+ * @param onChunk                 - 文本片段回调
+ * @param onDone                  - 文本流结束回调（仅 finish_reason != 'tool_calls'）
+ * @param onError                 - 出错回调
+ * @param signal                  - AbortSignal，用于取消请求
+ * @param onToolCallDelta         - 工具调用增量回调（可选，UI 实时显示"正在调用 XX"）
+ * @param onToolCalls             - 工具调用聚合完成回调（可选，finish_reason='tool_calls' 时触发）
+ * @param onInteractiveRequest    - 交互式工具请求回调（可选，ask_user_choice 触发时）
  */
 export const sendChatStream = async (
   message: string,
   sessionId: string,
   onChunk: (chunk: string) => void,
-  onDone: (full: string) => void,
+  onDone: (full: string, finishReason: FinishReason) => void,
   onError: (err: Error) => void,
   signal?: AbortSignal,
+  onToolCallDelta?: (delta: ToolCallDelta) => void,
+  onToolCalls?: (calls: ToolCall[]) => void,
+  onInteractiveRequest?: (req: InteractiveRequest) => void,
 ): Promise<void> => {
   console.info(`[API] POST /chat/stream [${sessionId}] 建立 SSE 连接…`)
 
@@ -122,6 +183,16 @@ export const sendChatStream = async (
   let buffer = ''
 
   /**
+   * 工具调用增量聚合：
+   *   同一个 index 的 tool_call 可能横跨 N 个 chunk 到达，
+   *   - id / type：仅在首个 delta 中出现（非空覆盖）
+   *   - function.name  ：可能单独一个 chunk
+   *   - function.arguments：可能拆成数十个 chunk 拼接
+   * 用 Map<index, ToolCall> 聚合，下标即是稳定 key。
+   */
+  const toolCallBuffer = new Map<number, ToolCall>()
+
+  /**
    * try-catch 包裹整个 read 循环，处理 Agent 进程崩溃导致的 TCP RST：
    *
    * 当 Express 进程被 kill 时，已建立的 TCP 连接被操作系统强制 RST，
@@ -165,14 +236,112 @@ export const sendChatStream = async (
           try {
             const data = JSON.parse(jsonStr) as Record<string, unknown>
 
+            // ─── 1) 工具调用增量（OpenAI 协议） ──────────
+            if (Array.isArray(data['tool_calls'])) {
+              const deltas = data['tool_calls'] as ToolCallDelta[]
+              for (const d of deltas) {
+                // 防御：index 缺失时退化为 0
+                const idx = typeof d.index === 'number' ? d.index : 0
+
+                /**
+                 * 累加规则：
+                 *   - id / type / function.name：首段非空覆盖（避免后段空串清空）
+                 *   - function.arguments      ：真正的"增量追加"
+                 *   - 字段缺失时保持原值不变
+                 */
+                const prev: ToolCall = toolCallBuffer.get(idx) ?? {
+                  id: '',
+                  type: 'function',
+                  function: { name: '', arguments: '' },
+                }
+
+                const next: ToolCall = {
+                  id: d.id ?? prev.id,
+                  type: d.type ?? prev.type,
+                  function: {
+                    name: d.function?.name ?? prev.function.name,
+                    arguments:
+                      (prev.function.arguments ?? '') + (d.function?.arguments ?? ''),
+                  },
+                }
+
+                toolCallBuffer.set(idx, next)
+                onToolCallDelta?.(d)
+              }
+              continue
+            }
+
+            // ─── 2) 文本 chunk ───────────────────────────
             if (typeof data['content'] === 'string' && !('sessionId' in data)) {
               onChunk(data['content'] as string)
-            } else if (typeof data['sessionId'] === 'string') {
-              console.info(`[API] ✅ SSE done [${data['sessionId']}] 传输完成`)
-              onDone(data['content'] as string)
-            } else if (typeof data['error'] === 'string') {
+              continue
+            }
+
+            // ─── 2.5) 交互式工具请求（ask_user_choice） ─────
+            // 后端在 LLM 决定调起交互式工具时下发，事件 data 形如：
+            //   { interactiveId, question, options: string[], multiSelect: boolean }
+            // 注意：interactiveId 与 LLM tool_call.id 一一对应；
+            // 前端回传选择时用此 id 关联到上一轮的 ask_user_choice。
+            if (typeof data['interactiveId'] === 'string' && Array.isArray(data['options'])) {
+              const req: InteractiveRequest = {
+                id: data['interactiveId'] as string,
+                question: (data['question'] as string) ?? '请选择',
+                options: (data['options'] as unknown[]).filter((o): o is string => typeof o === 'string'),
+                multiSelect: data['multiSelect'] === true,
+              }
+              console.info(
+                `[API] 🙋 SSE [${sessionId}] 收到交互式请求：${req.question}（${req.options.length} 选项, ${req.multiSelect ? '多选' : '单选'}）`,
+              )
+              onInteractiveRequest?.(req)
+              continue
+            }
+
+            // ─── 3) 流结束（done / tool_calls） ──────────
+            if (typeof data['sessionId'] === 'string') {
+              const finishReason = (data['finish_reason'] as FinishReason) ?? 'stop'
+              const full = (data['content'] as string) ?? ''
+
+              console.info(
+                `[API] ✅ SSE done [${data['sessionId']}] ` +
+                  `finish_reason=${finishReason} ` +
+                  `tool_calls=${toolCallBuffer.size}`,
+              )
+
+              if (finishReason === 'tool_calls' && toolCallBuffer.size > 0) {
+                /**
+                 * 场景 A：LLM 决定调用工具（不产出最终文本）
+                 * 把所有按 index 聚合好的完整 ToolCall 按下标升序交付。
+                 * 上层在收到此回调后应当：
+                 *   1) 把 assistant 的 tool_calls 写回 history
+                 *   2) 执行工具
+                 *   3) 把工具结果以 role='tool' 写回 history
+                 *   4) 再次调用 sendChatStream 发起下一轮
+                 *
+                 * 此处不调 onDone —— 因为本轮没有"最终文本"。
+                 */
+                const sorted = Array.from(toolCallBuffer.entries())
+                  .sort(([a], [b]) => a - b)
+                  .map(([, v]) => v)
+
+                onToolCalls?.(sorted)
+                continue
+              }
+
+              if (finishReason === 'length') {
+                console.warn('[API] ⚠️  SSE 因 max_tokens 截断')
+              } else if (finishReason === 'content_filter') {
+                console.warn('[API] ⚠️  SSE 因内容过滤截断')
+              }
+
+              onDone(full, finishReason)
+              continue
+            }
+
+            // ─── 4) 错误事件 ─────────────────────────────
+            if (typeof data['error'] === 'string') {
               console.error('[API] ❌ SSE error 事件：', data['error'])
               onError(new Error(data['error'] as string))
+              continue
             }
           } catch {
             console.warn('[API] ⚠️  SSE 行解析失败，跳过：', jsonStr.slice(0, 50))
@@ -182,6 +351,135 @@ export const sendChatStream = async (
     }
   } catch (err) {
     console.error('[API] ❌ SSE 连接中断（Agent 可能已崩溃）：', err)
+    onError(new Error('Agent 连接中断，请检查后端服务是否正常运行'))
+  }
+}
+
+/**
+ * continueInteractive — 用户在交互式工具上做出选择后，调用此函数恢复流
+ *
+ * 与 sendChatStream 流程几乎相同，唯一区别：
+ *   - POST /api/chat/continue（而非 /api/chat/stream）
+ *   - 请求体携带 interactiveId 与 choice
+ *   - 不再需要 onToolCallDelta（用户已经选过了）
+ *
+ * 复用场景：
+ *   恢复后 LLM 又触发新的交互式工具 → 通过 onInteractiveRequest 回调再次弹按钮
+ *   恢复后 LLM 进入最终回答 → 通过 onChunk / onDone 正常完成
+ *
+ * 复用此函数代替 sendChatStream 的原因：
+ *   - 避免在 useConversation.ts 中复制 SSE 解析代码
+ *   - 接口对调用方完全一致（onChunk / onDone / onError / onInteractiveRequest）
+ */
+export const continueInteractive = async (
+  sessionId: string,
+  interactiveId: string,
+  choice: string[],
+  onChunk: (chunk: string) => void,
+  onDone: (full: string, finishReason: FinishReason) => void,
+  onError: (err: Error) => void,
+  signal?: AbortSignal,
+  onInteractiveRequest?: (req: InteractiveRequest) => void,
+): Promise<void> => {
+  console.info(`[API] POST /chat/continue [${sessionId}] 恢复 interactiveId=${interactiveId}`)
+
+  let response: Response
+
+  try {
+    response = await fetch(`${BASE_URL}/chat/continue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, interactiveId, choice }),
+      signal,
+    })
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') {
+      console.info(`[API] 🛑 continue [${sessionId}] 请求已取消`)
+      onError(err as Error)
+      return
+    }
+    console.error('[API] ❌ /chat/continue 网络请求失败：', err)
+    onError(err as Error)
+    return
+  }
+
+  if (!response.ok) {
+    console.error(`[API] ❌ /chat/continue HTTP ${response.status}`)
+    onError(new Error(`HTTP ${response.status}`))
+    return
+  }
+
+  console.info('[API] 🔗 continue SSE 连接已建立，开始接收流…')
+
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        console.info('[API] ✅ continue SSE 流读取完毕')
+        break
+      }
+
+      buffer += decoder.decode(value, { stream: true })
+
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+
+      for (const line of lines) {
+        if (!line.trim()) continue
+
+        if (line.startsWith('data: ')) {
+          const jsonStr = line.slice(6).trim()
+          if (!jsonStr) continue
+
+          try {
+            const data = JSON.parse(jsonStr) as Record<string, unknown>
+
+            // 文本 chunk
+            if (typeof data['content'] === 'string' && !('sessionId' in data)) {
+              onChunk(data['content'] as string)
+              continue
+            }
+
+            // 交互式工具请求（恢复后又触发了新的 ask_user_choice）
+            if (typeof data['interactiveId'] === 'string' && Array.isArray(data['options'])) {
+              const req: InteractiveRequest = {
+                id: data['interactiveId'] as string,
+                question: (data['question'] as string) ?? '请选择',
+                options: (data['options'] as unknown[]).filter((o): o is string => typeof o === 'string'),
+                multiSelect: data['multiSelect'] === true,
+              }
+              console.info(`[API] 🙋 continue [${sessionId}] 又收到交互式请求：${req.question}`)
+              onInteractiveRequest?.(req)
+              continue
+            }
+
+            // 流结束
+            if (typeof data['sessionId'] === 'string') {
+              const finishReason = (data['finish_reason'] as FinishReason) ?? 'stop'
+              const full = (data['content'] as string) ?? ''
+              console.info(`[API] ✅ continue SSE done [${data['sessionId']}] finish_reason=${finishReason}`)
+              onDone(full, finishReason)
+              continue
+            }
+
+            // 错误
+            if (typeof data['error'] === 'string') {
+              console.error('[API] ❌ continue SSE error 事件：', data['error'])
+              onError(new Error(data['error'] as string))
+              continue
+            }
+          } catch {
+            console.warn('[API] ⚠️  continue SSE 行解析失败，跳过：', jsonStr.slice(0, 50))
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[API] ❌ continue SSE 连接中断：', err)
     onError(new Error('Agent 连接中断，请检查后端服务是否正常运行'))
   }
 }

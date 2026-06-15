@@ -10,6 +10,8 @@
 2. [ReAct 推理循环](#2-react-推理循环)
 3. [Function Calling 集成](#3-function-calling-集成)
 4. [工具体系设计](#4-工具体系设计)
+   - 4.5 交互式工具（人机协作）
+   - 4.6 续点机制：resumeInteractive
 5. [Skill 系统（Markdown 驱动）](#5-skill-系统markdown-驱动)
 6. [Prompt 工程](#6-prompt-工程)
 7. [会话与消息持久化](#7-会话与消息持久化)
@@ -17,6 +19,13 @@
 9. [类型系统设计](#9-类型系统设计)
 10. [错误处理与降级](#10-错误处理与降级)
 11. [注意事项清单](#11-注意事项清单)
+12. [LLM 调用重试机制](#12-llm-调用重试机制)
+13. [代码重构：消除重复](#13-代码重构消除重复)
+14. [LLM Provider 抽象层](#14-llm-provider-抽象层)
+15. [用户画像系统](#15-用户画像系统)
+16. [RAG 知识库](#16-rag-知识库)
+17. [食材替换系统](#17-食材替换系统)
+18. [膳食模式适配](#18-膳食模式适配)
 
 ---
 
@@ -59,10 +68,15 @@
   → 加载历史消息（DB）
   → ReAct 循环：
       ① 调用 LLM（带 tools 参数）
-      ② LLM 返回 tool_calls → 执行工具 → 结果追加到消息列表
+      ② LLM 返回 tool_calls
+          ├─ 普通工具    → executeTools → 结果追加到消息列表
+          └─ 交互式工具  → 触发 onInteractive 事件，paused=true，跳出循环
       ③ LLM 返回 content → 最终回答
   → 持久化所有消息（DB）
   → 返回结果给前端
+
+续点场景：用户在 /api/chat/continue 端点提交选择
+  → Agent.resumeInteractive() → 追加 role=tool 消息 → 继续 ReAct 循环
 ```
 
 ---
@@ -323,6 +337,274 @@ export async function executeTools(calls: ToolCall[], sessionId: string) {
 | **参数解析容错** | `JSON.parse` 可能失败，需要 try/catch |
 | **工具不存在时友好提示** | 返回 `success: false` 而非抛错 |
 
+### 4.5 交互式工具（人机协作）
+
+普通工具是"LLM 自主决策并执行"（范式 A），但有些场景 LLM 需要**先向用户确认偏好**才能给出准确答案（范式 B）。例如：
+
+> 用户："今天吃什么好？"
+> LLM：不确定场景，调起 `ask_user_choice(["早餐","午餐","晚餐"])` → 用户选"午餐" → LLM 继续
+
+#### 4.5.1 与普通工具的区别
+
+| 维度 | 普通工具 | 交互式工具 |
+|------|---------|-----------|
+| **执行主体** | Agent 后台执行 | 前端渲染选项，用户手动点选 |
+| **结果来源** | 函数返回值（结构化数据） | 用户点击的选项（字符串数组） |
+| **暂停 ReAct** | 不暂停，循环继续 | 暂停，标记 `paused=true` |
+| **结果如何进入历史** | 自动追加 `role: tool` 消息 | 需前端调 `/api/chat/continue`，由后端 `resumeInteractive` 补 |
+| **典型代表** | `search_recipe`、`calculate_nutrition` | `ask_user_choice` |
+
+#### 4.5.2 工具元信息示例
+
+[ask-user.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/tools/ask-user.ts) 定义了唯一的交互式工具：
+
+```typescript
+export const ask_user_tool: Tool = {
+  name: 'ask_user_choice',
+  description:
+    '当用户意图不明确、或 LLM 需要先收集关键偏好（场景/口味/饮食限制）才能给出准确回答时调用此工具。' +
+    '调用后系统会自动暂停回答，将选项交给用户在前端界面选择。' +
+    '不要用于：① 答案已经明确可查的情况（用 search_recipe 等查询工具）② 工具参数收集（用对应工具的参数）' +
+    'options 必须是 2-4 个候选，每个不超过 20 字。',
+  parameters: {
+    type: 'object',
+    properties: {
+      question:     { type: 'string',  description: '向用户提出的问题' },
+      options:      { type: 'array',   items: { type: 'string' }, description: '2-4 个候选选项' },
+      multi_select: { type: 'boolean', description: '是否允许多选，默认 false' },
+    },
+    required: ['question', 'options'],
+  },
+}
+
+// 兜底实现 — 正常流程不会执行
+export const ask_user_impl: ToolImpl = async () => ({
+  success: false,
+  error: 'ask_user_choice 工具由 Agent 拦截处理，不应通过 executeTool() 直接执行',
+})
+
+// 关键：把所有交互式工具名登记到这个集合
+export const INTERACTIVE_TOOL_NAMES: ReadonlySet<string> = new Set([ask_user_tool.name])
+```
+
+#### 4.5.3 Agent 中的拦截与分流
+
+`agent.handleToolCalls()` 是 `chat()` / `chatStream()` / `resumeInteractive()` 三者共用的工具调用处理入口：
+
+```typescript
+private async handleToolCalls(
+  messages, sessionId, assistantContent, assistantToolCalls, reactLog, step,
+  onInteractive?: (req: InteractiveRequest) => void,
+): Promise<{ toolCount: number; paused: boolean; interactiveRequests: InteractiveRequest[] }> {
+  if (!assistantToolCalls?.length) return { toolCount: 0, paused: false, interactiveRequests: [] }
+
+  // 1. 助手消息（包含全部 tool_calls）持久化
+  const toolMsg: Message = {
+    role: 'assistant',
+    content: assistantContent ?? '',
+    tool_calls: assistantToolCalls.map((c) => ({
+      id: c.id,
+      type: 'function' as const,
+      function: { name: c.function.name, arguments: c.function.arguments },
+    })),
+  }
+  messages.push(toolMsg)
+  await this.persistMessage(sessionId, toolMsg)
+
+  // 2. 拆分交互式 vs 非交互式
+  const interactiveRequests: InteractiveRequest[] = []
+  const executableCalls: ToolCall[] = []
+
+  for (const c of assistantToolCalls) {
+    if (INTERACTIVE_TOOL_NAMES.has(c.function.name)) {
+      const req = this.parseInteractiveArgs(c.id, c.function.arguments)
+      if (req) interactiveRequests.push(req)
+    } else {
+      executableCalls.push({ id: c.id, name: c.function.name, arguments: c.function.arguments })
+    }
+  }
+
+  // 3. 执行非交互式工具（并行），结果追加为 role=tool 消息
+  if (executableCalls.length > 0) {
+    const results = await executeTools(executableCalls, sessionId)
+    for (const { id, result } of results) {
+      messages.push({ role: 'tool', tool_call_id: id, content: result.success ? JSON.stringify(result.data) : `【工具执行失败】${result.error}` })
+      await this.persistMessage(sessionId, messages[messages.length - 1])
+    }
+  }
+
+  // 4. 处理交互式工具 → 触发回调 + 标记 paused
+  if (interactiveRequests.length > 0) {
+    for (const req of interactiveRequests) onInteractive?.(req)
+  }
+
+  return {
+    toolCount: executableCalls.length,
+    paused: interactiveRequests.length > 0,
+    interactiveRequests,
+  }
+}
+```
+
+#### 4.5.4 参数解析容错
+
+LLM 输出的参数不一定严格符合 schema。`parseInteractiveArgs()` 在解析失败或选项为空时返回 `null` 而不是抛错，避免单个不规范的工具调用导致整条 SSE 流中断：
+
+```typescript
+private parseInteractiveArgs(id: string, argsStr: string): InteractiveRequest | null {
+  try {
+    const args = JSON.parse(argsStr)
+    const question = typeof args.question === 'string' ? args.question : '请选择'
+    const options = Array.isArray(args.options)
+      ? args.options.filter((o): o is string => typeof o === 'string')
+      : []
+    if (options.length === 0) {
+      console.warn(`[Agent] ⚠️ 交互式工具 ${id} 选项为空，跳过`)
+      return null
+    }
+    return { id, question, options, multiSelect: args.multi_select === true }
+  } catch (err) {
+    console.error(`[Agent] ❌ 解析交互式工具参数失败 [${id}]：`, (err as Error).message)
+    return null
+  }
+}
+```
+
+#### 4.5.5 关键注意事项
+
+| 要点 | 说明 |
+|------|------|
+| **所有交互式工具必须登记到 `INTERACTIVE_TOOL_NAMES`** | Agent 靠这个集合判断是否拦截 |
+| **交互式工具的 impl 不会被执行** | 它是兜底，正常流程走 `parseInteractiveArgs` + `onInteractive` 回调 |
+| **一个 LLM 响应可同时含普通 + 交互式工具** | 普通工具照常执行，交互式工具触发回调 + 标记 paused |
+| **参数解析失败不可中断流程** | 返回 `null` 跳过这条交互请求，避免整条 SSE 崩 |
+| **`options` 必须 2-4 个非空字符串** | schema 提示 + Agent 双重校验 |
+| **单选/多选统一为 `string[]`** | 前端不需区分语义，按 `multiSelect` 决定 UI |
+| **`multi_select` 默认为 false** | LLM 不指定时按单选处理 |
+
+### 4.6 续点机制：resumeInteractive
+
+用户提交选项后，前端调用 `POST /api/chat/continue` → `agent.resumeInteractive()` 恢复 ReAct 循环。
+
+#### 4.6.1 完整流程
+
+```
+POST /api/chat/continue  { sessionId, interactiveId, choice }
+       │
+       ▼
+ agent.resumeInteractive(sessionId, interactiveId, choice, ...)
+       │
+       ├─ 1. loadMessages(sessionId)  ← 触发 system prompt 初始化 / 上下文截断
+       │
+       ├─ 2. 在历史 messages 中反向查找
+       │      tool_call_id === interactiveId 的 assistant 消息
+       │      （找不到 → 抛 "会话已过期" 错误 → 500）
+       │
+       ├─ 3. 追加 role=tool 消息
+       │      content: JSON.stringify({ user_choice: choice })
+       │      tool_call_id: interactiveId
+       │      ← 这是 LLM 期待的工具结果，消息顺序约束靠它满足
+       │
+       └─ 4. 继续 ReAct 循环（与 chatStream 内层循环完全相同）
+              ├─ 再次碰到 ask_user_choice → 再次触发 onInteractive，paused=true
+              └─ 不再调用工具 → 进入流式输出 → onDone
+```
+
+#### 4.6.2 关键代码
+
+```typescript
+async resumeInteractive(
+  sessionId, interactiveId, choice,
+  onChunk, onDone, onInteractive, signal,
+): Promise<void> {
+  const messages = await this.loadMessages(sessionId)
+
+  // 找到对应的 tool_call
+  let targetCall: { id: string; name: string; arguments: string } | null = null
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'assistant' && m.tool_calls) {
+      for (const tc of m.tool_calls) {
+        if (tc.id === interactiveId) {
+          // 展平 { id, type, function: {...} } → { id, name, arguments }
+          targetCall = { id: tc.id, name: tc.function.name, arguments: tc.function.arguments }
+          break
+        }
+      }
+      if (targetCall) break
+    }
+  }
+
+  if (!targetCall) {
+    throw new Error(`未找到 interactiveId=${interactiveId} 对应的工具调用，会话 ${sessionId} 可能已过期`)
+  }
+  if (!INTERACTIVE_TOOL_NAMES.has(targetCall.name)) {
+    throw new Error(`工具 ${targetCall.name} 不是交互式工具，无法用 resumeInteractive 恢复`)
+  }
+
+  // 追加 tool 消息
+  const toolResultMsg: Message = {
+    role: 'tool',
+    tool_call_id: interactiveId,
+    content: JSON.stringify({ user_choice: choice }),
+  }
+  messages.push(toolResultMsg)
+  await this.persistMessage(sessionId, toolResultMsg)
+
+  // 继续 ReAct 循环
+  let fullContent = ''
+  let totalToolCalls = 0
+  let cancelled = false
+  let paused = false
+  const reactLog: ReActStep[] = []
+
+  try {
+    for (let step = 1; step <= MAX_REACT_STEPS; step++) {
+      if (signal?.aborted) { cancelled = true; break }
+      const response = await this.callLLMWithRetry(messages)
+      const assistantContent = response.content
+      const assistantToolCalls = response.tool_calls
+
+      if (assistantToolCalls?.length > 0) {
+        const result = await this.handleToolCalls(
+          messages, sessionId, assistantContent, assistantToolCalls, reactLog, step, onInteractive,
+        )
+        totalToolCalls += result.toolCount
+        if (result.paused) { paused = true; break }
+      } else {
+        // 流式输出（与 chatStream 主体一致）
+        await this.llm.chatCompletionStream({ messages: messages as any, temperature: 0.7, max_tokens: 2048 },
+          (chunk) => { fullContent += chunk; onChunk(chunk) },
+          () => { /* done */ },
+          (err) => { /* error */ },
+          signal,
+        )
+        if (signal?.aborted) cancelled = true
+        break
+      }
+    }
+
+    // 中止 / 再次暂停 / 空回答 / 正常完成 —— 四个分支处理
+    // （代码与 chatStream 后处理完全一致，省略）
+  } catch (error) {
+    console.error(`[Agent] ❌ 恢复阶段失败 [${sessionId}]：`, error)
+    throw error
+  }
+}
+```
+
+#### 4.6.3 关键注意事项
+
+| 要点 | 说明 |
+|------|------|
+| **必须找到对应的 tool_call** | 否则 500 + 错误信息 "会话可能已过期"，引导用户刷新或重开会话 |
+| **必须校验工具是交互式的** | 防止误调导致消息顺序错误（OpenAI 400） |
+| **`tool_call_id` 必须严格匹配** | OpenAI 消息顺序约束要求 `tool` 消息前面紧跟的 `assistant(tool_calls)` 里能找到对应 id |
+| **支持连续交互** | 一次会话中 LLM 可能多次调起 `ask_user_choice`，每次都触发同样的 `interactive_request` 事件 |
+| **支持中断** | 续点后用户在 continue 流中按"停止"仍可中止，行为与 `chatStream` 一致 |
+| **持久化时机** | `role=tool` 消息在调用 LLM 之前持久化，保证历史可恢复 |
+| **非流式 `chat()` 暂不支持** | 检测到交互式工具时走兜底文案，引导用 `/chat/stream` |
+
 ---
 
 ## 5. Skill 系统（Markdown 驱动）
@@ -542,6 +824,8 @@ if (isFirstUserMessage) {
 | 返回方式 | 一次性返回完整结果 | 逐 token 推送 |
 | 用户体验 | 等待后一次性显示 | 打字机效果 |
 | 适用场景 | 短回答、API 调用 | 长文本、聊天场景 |
+| **可暂停** | ❌ | ✅（交互式工具） |
+| **可续点** | ❌ | ✅（`/api/chat/continue` 端点） |
 
 ### 8.2 实现代码
 
@@ -549,63 +833,91 @@ if (isFirstUserMessage) {
 /**
  * chatStream — 流式对话（SSE 推送）
  *
- * @param userMessage — 用户输入文本
- * @param sessionId   — 会话 ID
- * @param onChunk     — 逐 token 回调（前端实现打字机效果）
- * @param onDone      — 完成回调（前端停止 streaming 状态）
- * @param signal      — AbortSignal，用于用户手动中止或连接断开时中断 LLM 生成
+ * @param userMessage   — 用户输入文本
+ * @param sessionId     — 会话 ID
+ * @param onChunk       — 逐 token 回调（前端实现打字机效果）
+ * @param onDone        — 完成回调（前端停止 streaming 状态）
+ * @param signal        — AbortSignal，用户中止或连接断开时中断 LLM 生成
+ * @param onInteractive — 交互式工具触发回调（可选，接收 InteractiveRequest）
+ *                        LLM 调起 ask_user_choice 时触发，调用方应通过 SSE 下发到前端
+ *                        并结束本轮（不调 onDone），等 /api/chat/continue 端点接管
  */
 async chatStream(
   userMessage: string,
   sessionId: string,
   onChunk: (delta: string) => void,
   onDone: (fullContent: string) => void,
-  signal?: AbortSignal,  // ← 中止信号
+  signal?: AbortSignal,
+  onInteractive?: (req: InteractiveRequest) => void,
 ): Promise<void> {
-  const messages = this.loadMessages(sessionId)
-  messages.push({ role: 'user', content: userMessage })
+  const messages = await this.loadMessages(sessionId)
+  await this.prependUserMessage(messages, sessionId, userMessage)
 
-  // ReAct 循环（工具调用阶段不流式）
-  for (let step = 1; step <= this.MAX_REACT_STEPS; step++) {
-    const response = await this.client.chat.completions.create({
-      model: this.model,
-      messages: messages,
-      tools: TOOL_LIST.map(...),
-      tool_choice: 'auto',
-    })
+  let fullContent = ''
+  let totalToolCalls = 0
+  let cancelled = false
+  let paused = false
+  const reactLog: ReActStep[] = []
 
-    const assistantMsg = response.choices[0].message
+  try {
+    for (let step = 1; step <= MAX_REACT_STEPS; step++) {
+      if (signal?.aborted) { cancelled = true; break }
 
-    if (assistantMsg.tool_calls?.length > 0) {
-      // 工具调用阶段：非流式
-      const results = await executeTools(toolCalls, sessionId)
-      messages.push(...toolMessages)
-    } else {
-      // 最终回答阶段：流式输出
-      const stream = await this.client.chat.completions.create({
-        model: this.model,
-        messages: messages,
-        stream: true,  // ← 开启流式
-        temperature: 0.7,
-        max_tokens: 2048,
-      })
+      const response = await this.callLLMWithRetry(messages)
+      const assistantContent = response.content
+      const assistantToolCalls = response.tool_calls
 
-      let fullContent = ''
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content
-        if (delta) {
-          fullContent += delta
-          onChunk(delta)  // 实时推送每个 token
+      if (assistantToolCalls && assistantToolCalls.length > 0) {
+        // 工具调用阶段：非流式，内部拆分流（普通 vs 交互式）
+        const result = await this.handleToolCalls(
+          messages, sessionId, assistantContent, assistantToolCalls, reactLog, step, onInteractive,
+        )
+        totalToolCalls += result.toolCount
+        if (result.paused) {
+          // 交互式工具触发 → 跳出循环，等待 resumeInteractive
+          paused = true
+          break
         }
+      } else {
+        // 最终回答阶段：流式输出
+        await this.llm.chatCompletionStream(
+          { messages: messages as any, temperature: 0.7, max_tokens: 2048 },
+          (chunk) => { fullContent += chunk; onChunk(chunk) },
+          () => { /* onComplete */ },
+          (err) => { /* onError */ },
+          signal,
+        )
+        if (signal?.aborted) cancelled = true
+        break
       }
+    }
 
-      // 持久化完整回答
-      messages.push({ role: 'assistant', content: fullContent })
-      this.persistMessage(sessionId, answerMsg)
-
+    // ── 后处理：4 个分支 ──
+    if (cancelled) {
+      // ① 中止：追加 [已中止] 标记 / 兜底文案
+      if (fullContent.length > 0) fullContent += '\n\n[已中止]'
+      else fullContent = '请求已被中断，请重试。'
+      await this.persistMessage(sessionId, { role: 'assistant', content: fullContent })
       onDone(fullContent)
       return
     }
+    if (paused) {
+      // ② 交互式工具暂停：不调 onDone，调用方（index.ts）应 res.end()
+      return
+    }
+    if (fullContent.length === 0) {
+      // ③ 空回答兜底
+      const fallback = '抱歉，这个问题比较复杂…'
+      await this.persistMessage(sessionId, { role: 'assistant', content: fallback })
+      onDone(fallback)
+      return
+    }
+    // ④ 正常完成
+    await this.persistMessage(sessionId, { role: 'assistant', content: fullContent })
+    onDone(fullContent)
+  } catch (error) {
+    console.error(`[Agent] ❌ 流式调用失败 [${sessionId}]：${(error as Error).message}`)
+    throw error
   }
 }
 ```
@@ -642,6 +954,40 @@ index.ts AbortController
 - **`for await` 遍历流**：使用 `for await (const chunk of stream)` 消费 OpenAI 的 SSE 流
 - **delta 可能为空**：某些 chunk 不含 content（如含 usage 信息），需要判空
 - **中止信号守卫**：SSE 端点的 `req.on('close')` 极易误触发，通过 `finished` / `hasStreamed` / `writableEnded` 三标记精确判断，参见 [streaming-guide.md](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/views/streaming-guide.md) §6.4
+- **暂停时不调 `onDone`**：交互式工具触发后 `paused=true`，调用方（index.ts）应主动 `res.end()`，等 `/api/chat/continue` 端点接手
+
+### 8.5 交互式工具的暂停与续点
+
+`chatStream` 在检测到 LLM 调起 `ask_user_choice` 时，**不会**调 `onDone`，而是触发 `onInteractive` 回调后立即返回。`index.ts` 中的 SSE 端点收到回调后通过 `sendEvent('interactive_request', ...)` 下发到前端，然后主动 `res.end()` 关闭当前 SSE 连接。
+
+前端在交互卡片中收集用户选项后，调用 `POST /api/chat/continue` 端点，触发 `agent.resumeInteractive()` 续点：
+
+```
+chatStream() ── onInteractive(req) ─▶ index.ts ─▶ SSE interactive_request 事件 ─▶ 前端
+                                                                                          │
+                                                                                          ▼  用户点击选项
+                                                                              POST /api/chat/continue
+                                                                                          │
+                                                                                          ▼
+resumeInteractive() ─▶ 找到 tool_call ─▶ 追加 role=tool 消息 ─▶ 继续 ReAct 循环 ─▶ 流式输出 ─▶ onDone
+```
+
+**为什么是"新开 SSE 流"而不是"复用旧流"？**
+
+旧 SSE 在 `interactive_request` 事件后已被后端 `res.end()` 关闭，前端 fetch 读取循环随之结束。浏览器侧没有任何标准方式"attach 回"已结束的响应（`EventSource` 一次只能监听一个连接，且不支持恢复；fetch 的 body reader 已 done）。最务实的做法是开新流。
+
+**复用点：** `agent.resumeInteractive()` 内部循环与 `chatStream()` 后半段几乎完全一致（都是 LLM 调 → 处理 tool_calls → 流式输出），共享 `handleToolCalls()` + `callLLMWithRetry()` 私有方法，差异仅在"消息加载后多追加一条 tool 消息"和"初始状态变量"。
+
+### 8.6 关键注意事项
+
+| 要点 | 说明 |
+|------|------|
+| **`onInteractive` 是可选参数** | 普通对话（非交互式场景）不传也无影响 |
+| **暂停时**不调 `onDone`** | 必须由调用方在 `onInteractive` 内主动 `res.end()`，避免连接悬挂 |
+| **续点必须找到对应 tool_call** | 否则 500 + "会话可能已过期"，引导用户刷新或重开 |
+| **续点可再次触发交互** | 一次会话中可能连续多次 `ask_user_choice`，每次都走同一条 `interactive_request` 协议 |
+| **续点的流式行为与新对话一致** | 仍然支持 `onChunk / onDone / signal` 全部参数，用户可随时中止 |
+| **持久化时机** | `role=tool` 消息在调用 LLM **之前**写入 DB，保证历史可恢复 |
 
 ---
 
@@ -692,6 +1038,17 @@ export interface ReActStep {
   actionInput?: unknown
   observation?: string
 }
+
+// ── 交互式请求（人机协作）──
+// LLM 调起 ask_user_choice 时，Agent 不会执行它，
+// 而是把 question/options 打包成此结构交给前端展示。
+// id 与 LLM 下发的 tool_call.id 一一对应。
+export interface InteractiveRequest {
+  id: string
+  question: string
+  options: string[]
+  multiSelect: boolean
+}
 ```
 
 ### 9.2 关键注意事项
@@ -700,6 +1057,7 @@ export interface ReActStep {
 - **ToolImpl 使用泛型**：`ToolImpl<T>` 让每个工具的参数类型精确
 - **ToolResult 统一格式**：所有工具返回相同结构，方便调度层统一处理
 - **ReActStep 用于日志**：记录每步推理过程，方便调试
+- **InteractiveRequest 与 tool_call.id 绑定**：`id` 字段不重不漏，前端回传选择时也带此 id
 
 ---
 
@@ -803,6 +1161,17 @@ catch (error) {
 - [ ] `for await` 遍历流时判空 delta
 - [ ] 流式完成后持久化完整内容
 
+### 交互式工具
+
+- [ ] 所有交互式工具登记到 `INTERACTIVE_TOOL_NAMES` 集合
+- [ ] 触发交互时**不调 `onDone`**，由调用方在 `onInteractive` 内主动 `res.end()`
+- [ ] `parseInteractiveArgs` 解析失败时返回 `null`，不抛错
+- [ ] `options` 数组为空时跳过该交互请求
+- [ ] 续点时反查历史 messages 找到对应的 tool_call
+- [ ] 续点时校验 tool_call 名称属于 `INTERACTIVE_TOOL_NAMES`
+- [ ] 续点时**先**追加 `role=tool` 消息**再**调 LLM（满足 OpenAI 消息顺序约束）
+- [ ] 续点 SSE 流复用 `onChunk / onDone / onInteractive / signal` 全部参数
+
 ### 错误处理
 
 - [ ] 工具层不抛异常
@@ -816,6 +1185,7 @@ catch (error) {
 - [ ] 记录工具调用和结果
 - [ ] 记录 token 消耗
 - [ ] 关键操作带 sessionId
+- [ ] 交互式工具触发时记录 `interactiveId` / `question` / `options.length`
 
 ---
 

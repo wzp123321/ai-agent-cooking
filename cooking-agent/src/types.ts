@@ -47,3 +47,15 @@ export interface ChatRequestBody {
   /** 会话 ID，默认为 'default'（可选） */
   sessionId?: string
 }
+
+/**
+ * /api/chat/continue 请求 Body
+ * 由前端在用户点击 ask_user_choice 选项后调用
+ */
+export interface ContinueRequestBody {
+  sessionId: string
+  /** 上一轮 ask_user_choice 的 tool_call_id */
+  interactiveId: string
+  /** 用户选择的选项（始终是数组，单选时只有一个元素） */
+  choice: string[]
+}

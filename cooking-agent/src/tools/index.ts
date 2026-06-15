@@ -21,12 +21,18 @@ import { suggest_tool, suggest_impl } from './suggest'
 import { substitute_tool, substitute_impl } from './substitute'
 import { diet_tool, diet_impl } from './diet'
 import { knowledge_tool, knowledge_impl } from './knowledge'
+import { ask_user_tool, ask_user_impl, INTERACTIVE_TOOL_NAMES } from './ask-user'
 
 // ─── 工具注册表 ────────────────────────────────────────────
 
 /**
  * 所有可用工具的元信息（供 OpenAI Function Calling 使用）
- * 顺序：recipe → nutrition → safety → technique → suggest
+ * 顺序：recipe → nutrition → safety → technique → suggest → substitute → diet → knowledge → ask_user
+ *
+ * 最后一名的 ask_user_choice 是"交互式工具"：
+ *   Agent 在执行前会通过 INTERACTIVE_TOOL_NAMES 识别它，
+ *   命中后走 pause-and-wait 流程（不下发到 LLM 工具调用执行层），
+ *   而是发送 SSE interactive_request 事件给前端，等待用户选择后由 /api/chat/continue 恢复。
  */
 export const TOOL_LIST: Tool[] = [
   recipe_tool,
@@ -37,6 +43,7 @@ export const TOOL_LIST: Tool[] = [
   substitute_tool,
   diet_tool,
   knowledge_tool,
+  ask_user_tool,
 ]
 
 /**
@@ -52,7 +59,11 @@ const TOOL_IMPLS: Record<string, ToolImpl<Record<string, unknown>>> = {
   [substitute_tool.name]: substitute_impl as ToolImpl<Record<string, unknown>>,
   [diet_tool.name]:       diet_impl       as ToolImpl<Record<string, unknown>>,
   [knowledge_tool.name]:  knowledge_impl  as ToolImpl<Record<string, unknown>>,
+  [ask_user_tool.name]:   ask_user_impl   as ToolImpl<Record<string, unknown>>,
 }
+
+// 重新导出交互式工具名称集合（供 agent.ts 使用）
+export { INTERACTIVE_TOOL_NAMES }
 
 // ─── 工具执行函数 ─────────────────────────────────────────
 
@@ -137,4 +148,4 @@ export async function executeTools(
 }
 
 // ─── 工具列表（供 Agent 直接引用）─────────────────────────
-export { recipe_tool, nutrition_tool, safety_tool, technique_tool, suggest_tool, substitute_tool, diet_tool, knowledge_tool }
+export { recipe_tool, nutrition_tool, safety_tool, technique_tool, suggest_tool, substitute_tool, diet_tool, knowledge_tool, ask_user_tool }

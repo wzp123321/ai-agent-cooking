@@ -16,8 +16,10 @@
 │       │                                                                     │
 │       │  ┌── step 1~N：工具调用（非流式，内部 ReAct loop）                 │
 │       │  │   · callLLMWithRetry → OpenAI SDK chat.completions.create        │
-│       │  │   · 返回 tool_calls → executeTools → 结果追加到 messages        │
-│       │  │   · 工具调用结果不会流式推送给前端                              │
+│       │  │   · 返回 tool_calls → 拆分为：                                  │
+│       │  │       ├── 普通工具 → executeTools → 结果追加到 messages        │
+│       │  │       └── 交互式工具（ask_user_choice）→ 触发 onInteractive 事件│
+│       │  │                       → paused=true，跳出循环                  │
 │       │  └── 直到 LLM 不再返回 tool_calls → 进入 answer 阶段               │
 │       │                                                                     │
 │       ▼                                                                     │
@@ -32,6 +34,16 @@
 │  sendEvent('done', { content, sessionId })  ← 通知前端流结束                │
 │  res.end()                                                                  │
 │                                                                             │
+│  ┌── 续点通道（交互式工具暂停后） ──────────────────────────────────┐      │
+│  POST /api/chat/continue  ← { sessionId, interactiveId, choice }   │      │
+│       │                                                             │      │
+│       ▼                                                             │      │
+│  agent.resumeInteractive()  ← 找到上一轮的 tool_call                │      │
+│       │   · 追加 role=tool 的消息（content=user_choice）            │      │
+│       │   · 继续 ReAct 循环（可能再次碰到 ask_user_choice）        │      │
+│       │   · 最终走流式输出                                         │      │
+│       └─────────────────────────────────────────────────────────────┘      │
+│                                                                             │
 └──────────────────────────────────┬──────────────────────────────────────────┘
                                    │ SSE (text/event-stream)
                                    ▼
@@ -39,17 +51,25 @@
 │                                                                             │
 │  sendChatStream()           ← 原生 fetch() + ReadableStream + TextDecoder   │
 │       │   · 逐行解析 SSE："data: {...}"                                    │
-│       │   · 按事件类型分派：chunk → onChunk, done → onDone                 │
+│       │   · 按事件类型分派：                                                │
+│       │       chunk              → onChunk                                 │
+│       │       done               → onDone                                  │
+│       │       interactive_request → onInteractiveRequest (渲染选择卡片)    │
+│       │       error              → onError                                 │
 │       ▼                                                                     │
 │  useConversation.sendMessage()  ← 状态编排层                                │
 │       │   · 创建 userMsg（存入 store.sessions[x].messages）                │
 │       │   · 创建空 aiMsg（streaming: true）                                │
 │       │   · onChunk → aiMsg.content += chunk                               │
+│       │   · onInteractiveRequest → aiMsg.interactive = { ... }             │
+│       │                              → aiMsg.streaming = false            │
 │       │   · onDone  → aiMsg.streaming = false                              │
 │       ▼                                                                     │
 │  MessageBubble.vue          ← 渲染层                                        │
 │       │   · marked.parse(content) → v-html                                │
 │       │   · streaming === true → 显示闪烁光标                              │
+│       │   · message.interactive && !interactiveResolved                    │
+│       │       → <InteractiveChoiceCard> 用户点选后调用 continueInteractive │
 │       ▼                                                                     │
 │  MessageList.vue + useScrollToBottom  ← 滚到底层                            │
 │       │   · watch(messages.map(m => m.content).join(''))                   │
@@ -92,11 +112,23 @@ data: {"content":"的"}
 event: done
 data: {"content":"好的，红烧肉的做法如下...","sessionId":"xxx"}
 
+event: interactive_request
+data: {"interactiveId":"tool_call_xxx","question":"你今天想吃什么场景的菜？","options":["早餐","午餐","晚餐"],"multiSelect":false}
+
 event: error
 data: {"error":"DeepSeek API 超时"}
 ```
 
 > **注意**：每两个 SSE 事件之间必须有空行 `\n\n`，这是 SSE 协议的消息分隔符。
+
+**事件类型一览：**
+
+| 事件 | data 字段 | 触发时机 | 前端动作 |
+|------|----------|---------|---------|
+| `chunk` | `{ content: string }` | LLM 输出每个 token | 追加到 aiMsg.content |
+| `done` | `{ content, sessionId, finish_reason? }` | 流正常结束 | 关闭 streaming，刷新历史 |
+| `interactive_request` | `{ interactiveId, question, options, multiSelect }` | LLM 调用 ask_user_choice | 渲染 InteractiveChoiceCard，等待用户选择 |
+| `error` | `{ error: string }` | LLM/工具/SSE 异常 | 显示错误提示，关闭 loading |
 
 **ReAct 与流式的关系：**
 
@@ -112,6 +144,8 @@ data: {"error":"DeepSeek API 超时"}
 ```
 
 > **关键限制**：工具调用阶段不会向前端推送任何中间状态。前端的 AI 消息气泡会从空内容开始，等流式阶段才出现文字。如果工具调用耗时很长（多次 Retry），用户会看到长时间无响应。
+>
+> **特殊工具 ask_user_choice**：当 LLM 调起 `ask_user_choice` 时，Agent 不会执行该工具，而是下发 `interactive_request` SSE 事件后暂停，等待用户在前端选择。详见 [六、交互式工具与续点](#六交互式工具与续点)。
 
 ---
 
@@ -142,9 +176,21 @@ while (true) {
     // 解析 "data: {...}" 行
     if (line.startsWith('data: ')) {
       const data = JSON.parse(line.slice(6).trim())
-      if (data.content && !data.sessionId) onChunk(data.content)   // chunk 事件
-      if (data.sessionId)                  onDone(data.content)    // done 事件
-      if (data.error)                      onError(new Error(data.error))
+      // ── chunk 事件 ──
+      if (data.content && !data.sessionId) onChunk(data.content)
+      // ── done 事件 ──
+      if (data.sessionId)                   onDone(data.content)
+      // ── interactive_request 事件 ──
+      if (data.interactiveId) {
+        onInteractiveRequest({
+          id: data.interactiveId,
+          question: data.question,
+          options: data.options,
+          multiSelect: data.multiSelect,
+        })
+      }
+      // ── error 事件 ──
+      if (data.error)                       onError(new Error(data.error))
     }
   }
 }
@@ -275,6 +321,8 @@ watch(
 
 ## 四、数据流时序图
 
+### 4.1 普通流式对话
+
 ```
  用户点击发送
       │
@@ -307,6 +355,73 @@ watch(
       │     │                      store.loading = false
 ```
 
+### 4.2 交互式工具（ask_user_choice）流程
+
+```
+ 用户发送 "今天吃什么"
+      │
+      ▼
+ useConversation.sendMessage()
+      │
+      ├─ store.loading = true
+      ├─ sendChatStream(..., {onChunk, onDone, onError, onInteractiveRequest})
+      │     │
+      │     ├─ fetch POST /api/chat/stream
+      │     │     │
+      │     │     └── 后端 ReAct 循环
+      │     │           │
+      │     │           └── LLM 返回 ask_user_choice tool_call
+      │     │                 │
+      │     │                 ▼
+      │     │           onInteractive 回调触发
+      │     │                 │
+      │     │                 ▼
+      │     │     sendEvent('interactive_request', {
+      │     │       interactiveId: 'tool_call_xxx',
+      │     │       question:     '你今天想吃什么场景的菜？',
+      │     │       options:      ['早餐','午餐','晚餐'],
+      │     │       multiSelect:  false
+      │     │     })
+      │     │
+      │     │     └─ onInteractiveRequest ─▶ aiMsg.interactive = { ... }
+      │     │                              ▶ aiMsg.streaming = false
+      │     │                              ▶ store.loading = false
+      │     │
+      │     │   <InteractiveChoiceCard :options="..." @select="submitInteractiveChoice" />
+      │     │                  │
+      │     │                  │ 用户点击"午餐"
+      │     │                  ▼
+      │     │     submitInteractiveChoice(['午餐'])
+      │     │                  │
+      │     │                  ├─ aiMsg.interactiveResolved = true
+      │     │                  ├─ 追加用户回答气泡
+      │     │                  ├─ sendChatStream 闭包变量 cleanup
+      │     │                  │
+      │     │                  ├─ continueInteractive(sessionId, interactiveId, ['午餐'])
+      │     │                  │     │
+      │     │                  │     ├─ fetch POST /api/chat/continue
+      │     │                  │     │     │
+      │     │                  │     │     └── agent.resumeInteractive()
+      │     │                  │     │           │
+      │     │                  │     │           ├── 追加 role=tool 消息（content=user_choice）
+      │     │                  │     │           ├── 继续 ReAct 循环
+      │     │                  │     │           └── 进入流式回答阶段
+      │     │                  │     │
+      │     │                  │     │   chunk① ────▶ 新增 aiMsg.content += "好的"
+      │     │                  │     │   chunk② ────▶ aiMsg.content += "好的,午餐"
+      │     │                  │     │   ...
+      │     │                  │     │   done   ────▶ aiMsg.streaming = false
+      │     │                  │     │
+      │     │                  │     └─ onError ───▶ ElMessage.error
+      │     │
+      │     └─ 旧 SSE 连接 res.end() 收尾（agent 因 paused=true 不调 onDone）
+      │
+      ▼
+ 流程结束
+```
+
+> **关键点**：交互卡片渲染在同一气泡中，提交后**新建一条 AI 气泡**承载后续回答。这是经过验证的 UX：避免长 bubble 内嵌表单造成视觉混乱，也便于按消息单元 abort / 删除。
+
 ---
 
 ## 五、当前已知问题清单（含已修复）
@@ -321,6 +436,7 @@ watch(
 | 🟡 P1 | **Markdown 重复解析全量文本** | ✅ 已修复 | [MessageBubble.vue](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/components/MessageBubble.vue#L21-L63) — `computed → ref + watch`，流式过程中 60ms 节流批量解析 |
 | 🟢 P2 | **滚动不跟随手动暂停** | ✅ 已修复 | [useScrollToBottom.ts](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/hooks/useScrollToBottom.ts) — 离底部 ≥ 80px 时暂停自动滚底，3 秒冷却期后恢复 |
 | 🎨 UI | **头像/思考过程/按钮过于简陋** | ✅ 已修复 | [MessageBubble.vue](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/components/MessageBubble.vue) — 见 §6.4 UI 重构详情 |
+| 🆕 Feature | **交互式工具（ask_user_choice）** | ✅ 已实现 | 详见 §9。新增 `interactive_request` SSE 事件 + `/api/chat/continue` 续点端点 + 前端状态机 |
 | 🟡 P1 | **ReAct 阶段无反馈** | 📋 待实现 | 见 §7.1 |
 | 🟡 P1 | **SSE 断连无自动重连** | 📋 待实现 | 见 §7.2 |
 | 🟡 P1 | **客户端心跳超时** | 📋 待实现 | 见 §7.3 |
@@ -722,3 +838,191 @@ function parseMarkdown() {
 | 🔜 下一批 | ReAct 中间状态反馈 + 客户端心跳超时 | 半天 | 用户感知大幅提升，消除"卡住"焦虑 |
 | 📅 后续 | SSE 断连重试 + 移动端切后台恢复 | 半天 | 弱网和移动端体验明显改善 |
 | 🔮 远期 | 增量 Markdown 解析 + Web Worker 渲染 + 虚拟滚动 | 1-2 天 | 极限场景（超长回复、超长历史）性能保障 |
+
+---
+
+## 九、交互式工具与续点
+
+> 厨神小助已支持"人机协作"工具调用：LLM 主动把决策权交还用户，本节介绍完整实现。
+
+### 9.1 设计目标
+
+LLM 工具调用有 2 种范式：
+
+| 范式 | 含义 | 工具举例 |
+|------|------|---------|
+| **A. 自主执行** | LLM 决策后自动调用工具，工具返回结构化结果 | `search_recipe`、`calculate_nutrition` |
+| **B. 人机协作** | LLM 决策后暂停，把问题交由用户回答 | `ask_user_choice` |
+
+`ask_user_choice` 是范式 B 的入口：让 LLM 在不确定场景时主动向用户提问（如"早餐/午餐/晚餐？"），前端用按钮呈现选项，用户点击后 LLM 继续推理。
+
+### 9.2 协议设计
+
+复用 SSE 通道，加 2 个事件 + 1 个新端点：
+
+| 新增 | 类型 | 说明 |
+|------|------|------|
+| `interactive_request` 事件 | 后端 → 前端 | LLM 调起 ask_user_choice 时下发 `{ interactiveId, question, options, multiSelect }` |
+| `POST /api/chat/continue` 端点 | 前端 → 后端 | 用户提交选项后调用，请求体 `{ sessionId, interactiveId, choice: string[] }`，响应是另一条 SSE 流 |
+
+> **不复用旧 SSE 流的原因**：浏览器侧的 `EventSource` / `fetch` 一旦 `done` 事件触发，连接就被关闭，无法 attach 回去。改为"开新流"，前端 `onChunk / onDone / onInteractiveRequest` 全部复用。
+
+### 9.3 后端：ReAct 中的拦截与续点
+
+#### 工具调用拆分流
+
+`agent.handleToolCalls()` 是 `chat()` / `chatStream()` / `resumeInteractive()` 三者共用的私有方法。它把 LLM 返回的 `tool_calls` 拆成两类：
+
+```
+                   LLM 返回 tool_calls
+                            │
+            ┌───────────────┴───────────────┐
+            ▼                                ▼
+   INTERACTIVE_TOOL_NAMES              其他工具
+   （含 ask_user_choice）            （含 search_recipe 等）
+            │                                │
+            ▼                                ▼
+   parseInteractiveArgs()           executeTools()
+   生成 InteractiveRequest          → 追加 tool 消息
+   触发 onInteractive 回调           → 累积到 reactLog
+   标记 paused=true                 → 不暂停，继续循环
+            │
+            ▼
+   agent.chatStream() 跳出循环
+   index.ts 主动 res.end()
+```
+
+#### 续点：resumeInteractive
+
+用户提交选项后，前端调用 `POST /api/chat/continue` → `agent.resumeInteractive()`：
+
+```typescript
+async resumeInteractive(
+  sessionId, interactiveId, choice,
+  onChunk, onDone, onInteractive, signal,
+): Promise<void> {
+  const messages = await this.loadMessages(sessionId)         // ① 加载历史
+
+  // ② 找到上一轮 assistant 消息里 interactiveId 对应的 tool_call
+  const targetCall = findCallById(messages, interactiveId)
+
+  // ③ 追加 role=tool 消息（这是 LLM 期待的工具结果）
+  messages.push({
+    role: 'tool',
+    tool_call_id: interactiveId,
+    content: JSON.stringify({ user_choice: choice }),
+  })
+  await this.persistMessage(sessionId, toolResultMsg)
+
+  // ④ 继续 ReAct 循环（与 chatStream 内层循环完全相同）
+  for (let step = 1; step <= MAX_REACT_STEPS; step++) { ... }
+}
+```
+
+### 9.4 前端：交互状态机
+
+`useConversation.ts` 用模块级单例持有"当前 SSE 请求"对象，避免用户在等待时切换会话造成状态错乱。
+
+**状态机：**
+
+```
+                  sendMessage()
+                       │
+                       ▼
+              ┌─────────────────┐
+              │   streaming     │◀──────────┐
+              │ (chunk 事件中)  │           │
+              └──────┬──────────┘           │
+                     │                      │
+       interactive_request                  │
+                     │                      │
+                     ▼                      │
+              ┌─────────────────┐           │
+              │  interactive    │           │
+              │  (等待用户选择)  │           │
+              └──────┬──────────┘           │
+                     │                      │
+            submitInteractiveChoice()       │
+                     │                      │
+                     ▼                      │
+              ┌─────────────────┐           │
+              │   continuing    │           │
+              │ (continue SSE)  │           │
+              └──────┬──────────┘           │
+                     │                      │
+                done │                      │
+                     ▼                      │
+              ┌─────────────────┐           │
+              │     idle        │           │
+              └─────────────────┘           │
+                                            │
+   又收到 interactive_request ──────────────┘
+```
+
+**关键代码片段（[useConversation.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/useConversation.ts)）：**
+
+```typescript
+// 模块级单例 — 同一时刻只允许一条 SSE 请求
+let currentRequest: ChatRequest | null = null
+
+async function sendMessage(content: string) {
+  // 若有进行中的请求，先 abort
+  currentRequest?.abort()
+
+  // 创建新请求
+  const req = createRequest(content)
+  currentRequest = req
+
+  await sendChatStream(content, ..., {
+    onChunk: (chunk) => { aiMsg.content += chunk },
+    onDone: (full) => { aiMsg.streaming = false },
+    onInteractiveRequest: (interactive) => {
+      aiMsg.interactive = interactive
+      aiMsg.streaming = false
+      store.loading = false  // 用户可继续操作
+    },
+    onError: (err) => { ... },
+  })
+}
+
+async function submitInteractiveChoice(interactiveId: string, choice: string[]) {
+  const req = currentRequest
+  req?.abort()  // 关闭旧 SSE（agent 已因 paused=true 自然结束）
+
+  // 标记交互已解决（卡片变成"已选"态）
+  const aiMsg = findMessageByInteractiveId(interactiveId)
+  aiMsg.interactiveResolved = true
+  aiMsg.interactiveChoice = choice
+
+  // 追加用户回答气泡
+  const userMsg = { role: 'user', content: formatChoice(choice) }
+  aiMsg.session.messages.push(userMsg)
+
+  // 新建 AI 气泡承载后续回答
+  const newAiMsg = createEmptyAiMsg()
+  newAiMsg.streaming = true
+  aiMsg.session.messages.push(newAiMsg)
+
+  // 调起 continue
+  currentRequest = createRequestForContinue()
+  await continueInteractive(req.sessionId, interactiveId, choice, {
+    onChunk: (chunk) => { newAiMsg.content += chunk },
+    onDone: (full) => { newAiMsg.streaming = false },
+    onInteractiveRequest: (interactive) => { ... },  // 仍可能再次触发
+    onError: (err) => { ... },
+  })
+}
+```
+
+### 9.5 关键注意事项
+
+| 要点 | 说明 |
+|------|------|
+| **`interactiveId` 是 `tool_call.id`** | 同一 LLM 响应中 id 唯一，跨轮可能重复（用最新一条） |
+| **`choice` 始终是数组** | 单选/多选统一用 `string[]` 表示，前端不需区分语义 |
+| **暂停时**不调 `onDone`** | `agent.chatStream` 因 `paused=true` 跳出循环后直接 return，调用方应主动 `res.end()` |
+| **续点端点参数校验** | `interactiveId` 必须能在历史 messages 中找到对应 `tool_call`，否则 400 + 详细错误 |
+| **续点可能再触发交互** | 一次会话中可多次出现 `interactive_request`（多轮澄清），后端 `resumeInteractive` 内层 ReAct 循环也会调用 `handleToolCalls`，行为一致 |
+| **前端 UI 状态机** | 用模块级单例 `currentRequest` 持有进行中请求，切会话时主动 abort，避免脏数据 |
+| **PII 隔离** | `InteractiveRequest` 不含 sessionId 等敏感字段，由后端通过 `tool_call.id` ↔ 会话历史反查 |
+| **非流式 `chat()` 暂不支持** | 检测到 `paused=true` 时走兜底文案，引导用户用 `/chat/stream` 重新提问 |
