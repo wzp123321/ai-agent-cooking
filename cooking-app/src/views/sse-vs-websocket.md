@@ -118,7 +118,7 @@ sendEvent('error', { error: message })          // 错误通知
     Last-Event-ID: <上一次最后收到的事件 ID>
 ```
 
-本项目使用 `fetch + ReadableStream` 而非 `EventSource`（因为需要 POST 方法、自定义请求头），所以这个能力需要自己实现，但它本身是 SSE 协议自带的能力。
+本项目使用 `fetch + ReadableStream` 而非 `EventSource`（因为需要 POST 方法、自定义请求头），所以这个能力需要自己实现——P1 优化中已通过 [useAutoReconnect.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useAutoReconnect.ts) 包装器实现指数退避 1s→2s→4s 最多 3 次重连，**保留已收到的 aiMsg 文本不重置**。但 Last-Event-ID 断点续传尚未实现（复杂度高，依赖后端会话状态可恢复），详见 [streaming-guide.md §7.2](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/views/streaming-guide.md)。
 
 **④ HTTP/2 多路复用**
 在 HTTP/2 下，多个 SSE 流可以复用同一个 TCP 连接，不会像 WebSocket 那样每个连接独占一个 TCP 连接。对于需要同时监听多个推送通道的场景（虽然本项目不需要），这是显著优势。
@@ -248,6 +248,18 @@ HTTP Upgrade 握手成功后，协议从 HTTP 切换为 WebSocket，Express/Koa 
 - Express 的 CORS / 限流 / 日志中间件对 SSE 路由完全有效
 - 前端已有的 `fetch` 封装和 `AbortController` 取消机制直接复用
 - `/api/chat`（非流式）和 `/api/chat/stream`（流式）共用同一个 Agent，只是结果推送方式不同
+
+### 5.5 P1 优化：SSE 心跳 + 自动重连（针对 `fetch + ReadableStream` 实现）
+
+由于本项目使用 `fetch + ReadableStream` 而非 `EventSource`，SSE 自带的 `Last-Event-ID` 重连机制和浏览器 `readyState` 事件都没了。P1 优化补齐了 2 个能力：
+
+| 能力 | 实现 | 解决的问题 |
+|------|------|----------|
+| **服务端心跳** | [http/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/sse.ts) `setInterval` 每 15s 写 `:heartbeat` 注释行 | 防止 nginx `proxy_read_timeout` (默认 60s) 切断长 ReAct 连接；前端消费器跳过注释行并 reset 30s 静默计时器 |
+| **客户端自动重连** | [useAutoReconnect.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useAutoReconnect.ts) 指数退避 1s→2s→4s 最多 3 次 | 弱网/移动端切后台后断连时**保留已收到的 aiMsg 文本不重置**，对用户透明地完成恢复 |
+| **SSE 注释行识别** | [api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts) `line.startsWith(':')` 跳过 + 触发 `onHeartbeat` | EventSource 原生忽略注释行，但 fetch 消费器必须自己实现 |
+
+详见 [streaming-guide.md §7.1-§7.3](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/views/streaming-guide.md) 与 P1 总结 §9。
 
 ---
 

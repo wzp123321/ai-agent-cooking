@@ -49,6 +49,76 @@ export const ask_user_tool: Tool = {
         type: 'boolean',
         description: '是否允许多选，默认 false（单选）',
       },
+      /**
+       * P1-7 引入：问题分类标签。
+       *
+       * 作用：
+       *   - 同一类问题（如 "diet"）的历史选择会聚合成偏好
+       *   - 后续可被系统 prompt 引用："用户最常选的 diet 类别是：减脂(5次) > 增肌(2次)"
+       *
+       * 推荐值（不强制）：
+       *   - "diet"      饮食目标（减脂/增肌/控糖/均衡…）
+       *   - "cuisine"   菜系偏好（川菜/粤菜/西餐…）
+       *   - "taste"     口味偏好（麻辣/清淡/酸甜…）
+       *   - "skill"     技能等级（新手/进阶/熟练）
+       *   - "scene"     用餐场景（早餐/午餐/宴客/便当…）
+       *   - "allergy"   过敏回避（花生/海鲜/乳制品…）
+       *   - ""          留空表示一次性/无法分类
+       */
+      category: {
+        type: 'string',
+        description: '问题分类标签，用于聚合用户偏好。可留空。',
+        enum: ['', 'diet', 'cuisine', 'taste', 'skill', 'scene', 'allergy'],
+      },
+      /**
+       * P2-9 引入：交互类型
+       *   - choice  : 选项按钮（默认），options 字段必填
+       *   - text    : 自由文本输入，前端用 textarea
+       *   - confirm : 确认弹窗，自动渲染 [确认]/[取消] 两个按钮
+       *   - slider  : 数值滑块，meta 字段必填且包含 min/max
+       */
+      type: {
+        type: 'string',
+        description: '交互类型。默认 choice。',
+        enum: ['choice', 'text', 'confirm', 'slider'],
+      },
+      /**
+       * P2-9 扩展参数（仅 type 为 text/slider 时生效）：
+       *   - text    : { placeholder?: string, maxLength?: number }
+       *   - slider  : { min: number, max: number, step?: number, default?: number, unit?: string }
+       *
+       * 注意：当前的 ToolParameterProperty 不支持嵌套 properties，
+       * 这里只声明类型为 object，LLM 根据 type 自行决定 meta 内部结构。
+       * 实际解析逻辑在 agent.ts 的 parseInteractiveArgs 中处理。
+       */
+      meta: {
+        type: 'object',
+        description: '扩展参数，依 type 而定。type=text 时支持 {placeholder, maxLength}；type=slider 时支持 {min, max, step, default, unit}。',
+      },
+      /**
+       * P2-10：选项配图（仅 type=choice 生效）。
+       * 数组，长度与 options 一致；缺位用 null。
+       * URL 必须以 https:// 开头，或 data:image/;base64, 的内联图。
+       * Agent 会做白名单校验，非法 URL 会被丢弃。
+       */
+      option_images: {
+        type: 'array',
+        description: '选项对应的图片 URL 列表，与 options 等长。',
+        items: { type: 'string' },
+      },
+      /**
+       * P2-11：答案有效性约束（仅 type=text 生效）。
+       *   - regex       : 用户答案必须完整匹配的正则字符串
+       *   - min_length  : 最小长度
+       *   - max_length  : 最大长度
+       *
+       * 注意：当前 schema 不支持嵌套 properties，LLM 自行决定内部字段，
+       * Agent 做防御性处理：长度限制 ≤ 200 字符，编译失败的正则会被丢弃。
+       */
+      validation: {
+        type: 'object',
+        description: '对用户答案的格式约束。type=text 时生效。可包含 {regex, min_length, max_length}。',
+      },
     },
     required: ['question', 'options'],
   },
@@ -62,6 +132,15 @@ export const ask_user_impl: ToolImpl<{
   question: string
   options: string[]
   multi_select?: boolean
+  category?: string
+  type?: 'choice' | 'text' | 'confirm' | 'slider'
+  meta?: Record<string, unknown>
+  option_images?: string[]
+  validation?: {
+    regex?: string
+    min_length?: number
+    max_length?: number
+  }
 }> = async () => {
   return {
     success: false,

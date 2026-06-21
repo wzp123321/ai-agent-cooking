@@ -59,3 +59,27 @@ export interface ContinueRequestBody {
   /** 用户选择的选项（始终是数组，单选时只有一个元素） */
   choice: string[]
 }
+
+/**
+ * /api/chat/cancel-interactive 请求 Body
+ *
+ * P1-8 引入：用户主动取消"待回答的交互式请求"。
+ *
+ * 触发场景：
+ *   - 交互卡片上多了"我不想回答"按钮
+ *   - 用户在 10 分钟后决定不回答，直接输入新问题
+ *   - 清除 pending_interactive，避免污染下一轮对话
+ */
+export interface CancelInteractiveRequestBody {
+  sessionId: string
+  /** 待取消的 interactiveId（与 /api/chat/continue 配对） */
+  interactiveId: string
+}
+
+/**
+ * P3-15：撤销最近一次"已回答"的交互式工具。
+ * Body 只需 sessionId。
+ */
+export interface UndoInteractiveRequestBody {
+  sessionId: string
+}

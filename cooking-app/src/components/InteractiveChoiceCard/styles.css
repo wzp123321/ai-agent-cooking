@@ -1,0 +1,236 @@
+/**
+ * InteractiveChoiceCard — 共享样式
+ */
+
+/* ═══ 卡片容器 ═══ */
+.interactive-card {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: linear-gradient(145deg, #fff8eb, #fdf3e0);
+  border: 1px solid #f3d9a8;
+  border-left: 3px solid #e88a1a;
+  box-shadow: 0 2px 8px rgba(232, 138, 26, 0.06);
+  transition: opacity 0.2s ease;
+}
+
+.interactive-card.resolved {
+  background: linear-gradient(145deg, #f4f5f7, #ebecf0);
+  border-color: #d6d8de;
+  border-left-color: #94a3b8;
+}
+
+.interactive-card.submitting {
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+/* ═══ 头部 (CardHeader) ═══ */
+.interactive-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.interactive-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.interactive-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b8651a;
+  letter-spacing: 0.02em;
+}
+
+.interactive-card.resolved .interactive-label {
+  color: #64748b;
+}
+
+/* ═══ 问题 (CardQuestion) ═══ */
+.interactive-question {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary, #2d2d2d);
+  margin-bottom: 10px;
+  font-weight: 500;
+}
+
+/* ═══ 选项区 ═══ */
+.interactive-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* ── 单选 (SingleOptionList) ── */
+.opt-button {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  background: #ffffff;
+  border: 1px solid #f0a030;
+  border-radius: 999px;
+  color: #c0651c;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  font-family: inherit;
+}
+
+.opt-button:hover:not(:disabled) {
+  background: #f0a030;
+  color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(232, 138, 26, 0.25);
+}
+
+.opt-button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.opt-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* ── 多选 (MultiOptionList) ── */
+.opt-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #e5d5b5;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary, #2d2d2d);
+  transition: all 0.18s ease;
+  user-select: none;
+}
+
+.opt-checkbox:hover:not(.disabled) {
+  border-color: #f0a030;
+  background: #fff8eb;
+}
+
+.opt-checkbox.checked {
+  border-color: #f0a030;
+  background: #fff3e0;
+  color: #c0651c;
+}
+
+.opt-checkbox.disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.opt-checkbox input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.opt-checkbox-box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid #d0c4a8;
+  border-radius: 4px;
+  background: #fff;
+  color: #fff;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.opt-checkbox.checked .opt-checkbox-box {
+  background: #f0a030;
+  border-color: #f0a030;
+}
+
+.opt-checkbox-label {
+  white-space: nowrap;
+}
+
+.opt-submit {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  background: linear-gradient(145deg, #f0a030, #e07b1e);
+  border: 0;
+  border-radius: 999px;
+  color: #fff;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  font-family: inherit;
+  box-shadow: 0 2px 8px rgba(232, 138, 26, 0.25);
+}
+
+.opt-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(232, 138, 26, 0.4);
+}
+
+.opt-submit:disabled {
+  background: #d6d8de;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.opt-submit-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: optSpin 0.7s linear infinite;
+}
+
+@keyframes optSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* ═══ 已解决 (ResolvedView) ═══ */
+.interactive-resolved {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.resolved-question {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.resolved-answer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #475569;
+}
+
+.resolved-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  background: #94a3b8;
+  color: #fff;
+  border-radius: 50%;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.resolved-text {
+  font-weight: 500;
+}

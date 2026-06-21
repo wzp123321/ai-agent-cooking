@@ -1,0 +1,303 @@
+/**
+ * SidebarPanel — 共享样式
+ */
+
+/* ═══ 容器 ═══ */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: clamp(16px, 2.5vw, 24px) clamp(14px, 2vw, 20px);
+  gap: clamp(14px, 2vw, 20px);
+  overflow: hidden;
+}
+
+/* ═══ Logo 区 (SidebarHeader) ═══ */
+.sidebar-header {
+  text-align: center;
+  padding-block-end: clamp(12px, 2vw, 18px);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+
+.sidebar-header::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 20%;
+  right: 20%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border-accent), transparent);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.logo-icon {
+  font-size: 32px;
+  filter: drop-shadow(0 2px 8px rgba(232,138,26,0.25));
+  transition: transform var(--duration-fast) var(--ease-out-back);
+}
+
+.logo-icon:hover {
+  transform: scale(1.1) rotate(-5deg);
+}
+
+.logo-text {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  background: var(--accent-gradient-soft);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.logo-sub {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-block-start: 6px;
+  font-weight: 400;
+}
+
+/* ═══ 新建对话按钮 (NewChatButton) ═══ */
+:deep(.new-chat-btn) {
+  width: 100%;
+  height: 44px;
+  border-radius: var(--radius-md) !important;
+  font-weight: 600 !important;
+  font-size: 14px !important;
+  letter-spacing: 0.01em;
+  background: var(--accent-gradient-soft) !important;
+  border: none !important;
+  box-shadow: 0 2px 12px rgba(232,138,26,0.18) !important;
+  transition:
+    transform var(--duration-fast) var(--ease-out-back),
+    box-shadow var(--duration-normal) var(--ease-out-expo) !important;
+}
+
+:deep(.new-chat-btn:hover) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px rgba(232,138,26,0.28) !important;
+}
+
+:deep(.new-chat-btn:active) {
+  transform: scale(0.97);
+}
+
+/* ═══ 通用区块标题 ═══ */
+.section-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-block-end: 10px;
+  font-weight: 600;
+}
+
+/* ═══ 会话列表 (SessionList) ═══ */
+.session-section {
+  flex-shrink: 0;
+}
+
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: clamp(140px, 22vh, 200px);
+  overflow-y: auto;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-out-expo),
+    color var(--duration-fast) var(--ease-out-expo),
+    transform var(--duration-fast) var(--ease-out-back);
+  font-size: 13px;
+  color: var(--text-secondary);
+  position: relative;
+}
+
+.session-item::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 1px solid transparent;
+  transition: border-color var(--duration-fast) var(--ease-out-expo);
+  pointer-events: none;
+}
+
+.session-item:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.session-item:hover::before {
+  border-color: var(--border-light);
+}
+
+.session-item:active {
+  transform: scale(0.98);
+}
+
+.session-item.active {
+  background: var(--accent-soft);
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
+.session-item.active::before {
+  border-color: var(--border-accent);
+}
+
+.session-item.active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 25%;
+  bottom: 25%;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+.session-icon { flex-shrink: 0; font-size: 14px; }
+
+.session-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-del {
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity var(--duration-fast) var(--ease-out-expo);
+}
+
+.session-item:hover .session-del { opacity: 1; }
+
+:deep(.session-item .session-del:hover) {
+  color: var(--danger) !important;
+}
+
+/* ═══ 快捷问题 (QuickQuestions) ═══ */
+.quick-section {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.quick-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.quick-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-align: start;
+  transition:
+    background var(--duration-fast) var(--ease-out-expo),
+    color var(--duration-fast) var(--ease-out-expo),
+    border-color var(--duration-fast) var(--ease-out-expo),
+    transform var(--duration-fast) var(--ease-out-back),
+    box-shadow var(--duration-fast) var(--ease-out-expo);
+  line-height: 1.5;
+  position: relative;
+  overflow: hidden;
+}
+
+.quick-btn::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--accent-gradient-soft);
+  opacity: 0;
+  transition: opacity var(--duration-normal) var(--ease-out-expo);
+}
+
+.quick-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+  box-shadow: var(--shadow-sm);
+  transform: translateX(2px);
+}
+
+.quick-btn:active {
+  transform: scale(0.98);
+}
+
+/* ═══ 底部状态指示灯 (StatusIndicator) ═══ */
+.sidebar-footer {
+  margin-block-start: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  padding-block-start: 14px;
+  border-block-start: 1px solid var(--border);
+  position: relative;
+}
+
+.sidebar-footer::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 20%;
+  right: 20%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border-accent), transparent);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.status-dot.online {
+  background: var(--success);
+  box-shadow: 0 0 10px rgba(16,185,129,0.5);
+  animation: pulseGlow 3s ease-in-out infinite;
+}
+
+.status-dot.offline {
+  background: var(--danger);
+  box-shadow: 0 0 6px rgba(239,68,68,0.25);
+}
+
+.status-text {
+  font-weight: 500;
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 6px rgba(16,185,129,0.4); }
+  50% { box-shadow: 0 0 14px rgba(16,185,129,0.7); }
+}

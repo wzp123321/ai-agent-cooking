@@ -1,6 +1,8 @@
 # SSE 流式回答渲染指南
 
 > 本文档梳理厨神小助智能体中 SSE (Server-Sent Events) 流式回答的完整渲染链路、各环节细节以及常见问题与解决思路。
+>
+> **配套深度文档**（后端视角）：[interactive-dialogue-deep-dive.md](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/interactive-dialogue-deep-dive.md) — 12 个底层原理（OpenAI 协议约束 / AbortSignal 重置 / LLM"记忆错觉" / 上下文截断对续点的影响）
 
 ---
 
@@ -263,15 +265,15 @@ watch(
 | **行被截断** | JSON 解析失败、部分事件丢失 | SSE 数据行可能被 chunk 边界切断 | 使用 `buffer` 缓存不完整行，`lines.pop()` 保留最后一行待下次拼接 |
 | **JSON 解析失败** | 控制台警告，某条 chunk 被跳过 | 上游发送了非 JSON 格式的数据或 data 字段格式不标准 | `try/catch` 包裹 `JSON.parse`，失败时跳过而非中断 |
 | **空白行干扰** | 重复触发空事件 | 上游多发送了空行 | `if (!line.trim()) continue` 过滤空白行 |
-| **SSE 注释行** | 注释被当作数据处理 | SSE 协议规定 `:` 开头的行是注释 | 当前代码未处理，如果上游发注释需加过滤 |
+| **SSE 注释行** | 注释被当作数据处理 | SSE 协议规定 `:` 开头的行是注释 | ✅ **已实现**：消费器先判 `line.startsWith(':')` 跳过注释行并触发 `onHeartbeat`（[api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts#L60-L70)），后端每 15s 发一条 `:heartbeat\n\n` 用于保活 |
 
 ### 3.2 连接与网络层面
 
 | 问题 | 现象 | 原因 | 解决思路 |
 |------|------|------|----------|
 | **Nginx 缓冲导致延迟** | 用户消息发出后等很久才一次性看到完整回复 | Nginx 默认会缓冲上游响应（`proxy_buffering on`），等整个响应体完整后才发给客户端 | ① 后端已设置 `X-Accel-Buffering: no` 请求头 ② Nginx 配置 `proxy_buffering off` ③ 或设置 `proxy_buf_size`/`proxy_buffer_size` |
-| **SSE 连接超时断开** | 长回复中途断掉，前端报错 | Express 默认 2 分钟超时，Nginx 默认 `proxy_read_timeout` 60s | ① `req.socket.setTimeout(0)` ② Nginx `proxy_read_timeout 300s` ③ 前端实现自动重连 |
-| **前端无自动重连** | 断连后用户需手动刷新 | 当前 `sendChatStream` 没有重连机制 | 可在 `onError` 中提示用户并自动重试（需注意幂等性） |
+| **SSE 连接超时断开** | 长回复中途断掉，前端报错 | Express 默认 2 分钟超时，Nginx 默认 `proxy_read_timeout` 60s | ① `req.socket.setTimeout(0)` ② Nginx `proxy_read_timeout 300s` ③ 前端心跳保活 + 自动重连 |
+| **网络异常自动重连** | 弱网/移动端切后台后断连 | TCP 被 OS/代理静默切断 | ✅ **已实现**：[useAutoReconnect.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useAutoReconnect.ts) 包裹 `sendChatStream`，指数退避 1s→2s→4s 最多 3 次，重连期间 `aiMsg` 文本/streaming 标记都保留不重置 |
 | **fetch 被 AbortController 取消** | 用户切换会话后旧请求被取消 | `AbortError` 是预期行为，当前已捕获 | 确保 `AbortError.name` 判断在 `catch` 最前面，避免误判为网络错误 |
 | **CORS 预检请求** | OPTIONS 请求 401 | 开发环境跨域时浏览器先发 OPTIONS（preflight），express cors 中间件已处理 | 配置 `credentials: 'include'` 时的 cookie 跨域策略 |
 
@@ -305,7 +307,7 @@ watch(
 
 | 问题 | 现象 | 原因 | 解决思路 |
 |------|------|------|----------|
-| **ReAct 工具调用阶段无反馈** | 用户看到"..."很久但没有文字输出 | `chatStream` 中 ReAct 循环使用非流式 `callLLMWithRetry`，只有最终回答才是流式 | 可在此阶段发送 SSE progress 事件（如 `event: tool_call\ndata: {"tool":"search_recipe"}\n\n`）告知用户正在进行中 |
+| **ReAct 工具调用阶段无反馈** | 用户看到"..."很久但没有文字输出 | `chatStream` 中 ReAct 循环使用非流式 `callLLMWithRetry`，只有最终回答才是流式 | ✅ **已实现**：ReAct 循环中下发 `progress` SSE 事件（4 种类型：`thinking` / `tool_call` / `tool_result` / `streaming`），前端 [ReActProgressIndicator.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/ReActProgressIndicator.vue) 渲染"🧠 正在推理第 N 步 / 🔧 正在调用工具 XX"指示器（参见 §10 P1 性能优化） |
 | **DeepSeek API 限流** | 请求返回 429 Too Many Requests | DeepSeek 有 RPM/TPM 限制 | ① rateLimit middleware 已做客户端限流 ② 可增加重试的退避策略 ③ 考虑多 API Key 轮转 |
 | **res.end() 未调用** | 前端永远连接中 | 异常路径没有调用 `res.end()` | 当前 `catch` 中有 `res.end()`，但需确保所有 code path 都覆盖 |
 | **并发 SSE 连接过多** | 服务器文件描述符耗尽 | 每个 SSE 占一个连接 | 设置最大并发 SSE 连接数限制 |
@@ -437,9 +439,10 @@ watch(
 | 🟢 P2 | **滚动不跟随手动暂停** | ✅ 已修复 | [useScrollToBottom.ts](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/hooks/useScrollToBottom.ts) — 离底部 ≥ 80px 时暂停自动滚底，3 秒冷却期后恢复 |
 | 🎨 UI | **头像/思考过程/按钮过于简陋** | ✅ 已修复 | [MessageBubble.vue](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/components/MessageBubble.vue) — 见 §6.4 UI 重构详情 |
 | 🆕 Feature | **交互式工具（ask_user_choice）** | ✅ 已实现 | 详见 §9。新增 `interactive_request` SSE 事件 + `/api/chat/continue` 续点端点 + 前端状态机 |
-| 🟡 P1 | **ReAct 阶段无反馈** | 📋 待实现 | 见 §7.1 |
-| 🟡 P1 | **SSE 断连无自动重连** | 📋 待实现 | 见 §7.2 |
-| 🟡 P1 | **客户端心跳超时** | 📋 待实现 | 见 §7.3 |
+| 🟡 P1 | **ReAct 阶段无反馈** | ✅ 已实现 | 见 §7.1 / §10。ReAct 循环中下发 `progress` SSE 事件，4 种类型：`thinking` / `tool_call` / `tool_result` / `streaming`；前端 [ReActProgressIndicator.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/ReActProgressIndicator.vue) 渲染"🧠 正在推理第 N 步 / 🔧 正在调用工具 XX"指示器 |
+| 🟡 P1 | **SSE 断连无自动重连** | ✅ 已实现 | 见 §7.2 / §10。[useAutoReconnect.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useAutoReconnect.ts) — 指数退避 1s→2s→4s 最多 3 次，重连期间 aiMsg 文本/streaming 标记都保留不重置 |
+| 🟡 P1 | **客户端心跳超时** | ✅ 已实现 | 见 §7.3 / §10。后端 [sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/sse.ts) 每 15s 发一条 `:heartbeat\n\n` 保活；前端 [api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts) 识别注释行触发 `onHeartbeat` → `resetInactivityTimer()`，防止长 ReAct 推理被误判为卡住 |
+| 🟡 P1 | **流式 Markdown 重渲染卡顿** | ✅ 已实现 | [MarkdownContent.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/MarkdownContent.vue) — `computed → ref + watch`，流式过程中 60ms 节流批量解析；Mermaid / KaTeX 改为动态 import 减少首屏 bundle |
 | 🟢 P2 | **移动端切后台断连** | 📋 待实现 | 见 §7.4 |
 | 🟢 P2 | **代码块流式闪烁** | 📋 待实现 | 见 §7.5 |
 | ⚪ P3 | **v-html 安全策略** | 📋 评估中 | marked 默认不转义 HTML 标签，建议加 DOMPurify |
@@ -604,143 +607,231 @@ try {
 
 ## 七、待提升项详解
 
-### 7.1 ReAct 推理中间状态反馈 🟡 P1
+### 7.1 ReAct 推理中间状态反馈 ✅ 已实现
 
-**现状**：`agent.chatStream()` 中的 ReAct 循环使用非流式 `callLLMWithRetry`，工具调用阶段完全黑盒。用户只看到空 AI 气泡 + 闪烁光标，不知道 Agent 在做什么。
+**目标**：`agent.chatStream()` 中的 ReAct 循环使用非流式 `callLLMWithRetry`，工具调用阶段完全黑盒。让前端在每个 ReAct 阶段都能收到"正在做什么"的反馈。
 
-**影响**：工具调用（如搜索菜谱 API）可能耗时 2-5 秒，加上 LLM 重试可达 10 秒以上。用户会以为卡死了。
+**协议** — 后端在 4 个关键时机下发 `progress` SSE 事件，data 字段为结构化 JSON：
 
-**实现思路**：
+| `type` 字段 | 触发时机 | 关键字段 | 前端渲染 |
+|------------|---------|---------|---------|
+| `thinking` | LLM 调用前 | `step: number, maxSteps: number` | `🧠 正在推理第 1 / 5 步…` |
+| `tool_call` | 工具即将执行 | `step: number, toolNames: string[]` | `🔧 正在调用 search_recipe、calculate_nutrition…` |
+| `tool_result` | 工具执行完成 | `step: number, count: number` | （通常下一帧就到 streaming，不专门渲染避免闪烁） |
+| `streaming` | 进入流式回答 | `step: number` | （已被 ThinkingDots + typing-cursor 接管，不渲染） |
 
-在 `sendEvent` 工具函数中新增一个 `status` 事件类型，在 ReAct 循环的各阶段发送进度：
+**SSE 事件示例**：
 
-```typescript
-// index.ts — 后端 SSE 端点新增状态事件
-const sendStatus = (phase: string, detail: string) => {
-  sendEvent('status', { phase, detail })
-}
+```
+event: progress
+data: {"type":"thinking","step":1,"maxSteps":5}
 
-await agent.chatStream(
-  message, sessionId,
-  // 新增 onStatus 回调
-  (phase, detail) => { sendStatus(phase, detail) },
-  (chunk) => { sendEvent('chunk', { content: chunk }) },
-  (full) => { sendEvent('done', { content: full, sessionId }) },
-)
+event: progress
+data: {"type":"tool_call","step":1,"toolNames":["search_recipe"]}
+
+event: progress
+data: {"type":"tool_result","step":1,"count":1}
+
+event: progress
+data: {"type":"streaming","step":2}
 ```
 
-```typescript
-// agent.ts — chatStream 中注入状态回调
-async chatStream(
-  userMessage: string,
-  sessionId: string,
-  onStatus: (phase: string, detail: string) => void,  // ← 新增
-  onChunk: (delta: string) => void,
-  onDone: (fullContent: string) => void,
-) {
-  for (let step = 1; step <= MAX_REACT_STEPS; step++) {
-    onStatus('reasoning', `正在思考第 ${step} 步…`)
-    const response = await this.callLLMWithRetry(messages)
+**后端实现**（[react-loop.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/agent/react-loop.ts)）：
 
-    if (response.tool_calls?.length) {
-      onStatus('tool_call', `正在查询：${response.tool_calls.map(c => c.function.name).join('、')}`)
-      // ... 执行工具 ...
-      onStatus('tool_done', `查询完成`)
-    } else {
-      onStatus('answering', '正在组织回答…')
-      // ... 流式输出 ...
+```typescript
+export interface ReActLoopDeps {
+  // ... 原有 ...
+  onProgress?: (event: ReActProgressEvent) => void
+}
+
+export type ReActProgressEvent =
+  | { type: 'thinking'; step: number; maxSteps: number }
+  | { type: 'tool_call'; step: number; toolNames: string[] }
+  | { type: 'tool_result'; step: number; count: number }
+  | { type: 'streaming'; step: number }
+
+// ReAct 循环体内
+deps.onProgress?.({ type: 'thinking', step, maxSteps: deps.maxSteps })
+const response = await deps.callLLM(messages)
+
+if (response.tool_calls?.length > 0) {
+  deps.onProgress?.({
+    type: 'tool_call', step,
+    toolNames: response.tool_calls.map(tc => tc.function.name).filter(Boolean),
+  })
+  const result = await deps.handleTools(...)
+  deps.onProgress?.({ type: 'tool_result', step, count: result.toolCount })
+} else {
+  deps.onProgress?.({ type: 'streaming', step })
+  // ... 进入流式输出 ...
+}
+```
+
+**SSE 路由层**（[chat.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/routes/chat.ts)）：把 `onProgress` 透传给 agent，agent 调用时通过 `sendSSEEvent(res, 'progress', event)` 写入 SSE 流。
+
+**前端实现**（[api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts)）：
+
+```typescript
+// 在 SSE 行解析循环中
+if (typeof data['type'] === 'string' && isProgressType(data['type'])) {
+  handlers.onProgress?.(data as unknown as ReActProgressEvent)
+  continue
+}
+
+function isProgressType(t: string): t is ReActProgressEvent['type'] {
+  return t === 'thinking' || t === 'tool_call' || t === 'tool_result' || t === 'streaming'
+}
+```
+
+**UI 组件**（[ReActProgressIndicator.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/ReActProgressIndicator.vue)）：
+
+```vue
+<script setup lang="ts">
+const progress = useReActProgress()
+const visible = computed(() => {
+  const p = progress.value
+  if (!p) return null
+  if (p.type === 'thinking') {
+    return { icon: '🧠', text: `正在推理第 ${p.step} / ${p.maxSteps} 步…` }
+  }
+  if (p.type === 'tool_call') {
+    const names = p.toolNames.length === 0 ? '工具'
+      : p.toolNames.length <= 2 ? p.toolNames.join('、')
+      : `${p.toolNames.length} 个工具`
+    return { icon: '🔧', text: `正在调用${names}…` }
+  }
+  return null
+})
+</script>
+
+<template>
+  <Transition name="progress-fade">
+    <div v-if="visible" class="react-progress-indicator" :key="visible.text">
+      <span class="react-progress-icon">{{ visible.icon }}</span>
+      <span class="react-progress-text">{{ visible.text }}</span>
+      <span class="react-progress-dots"><span>.</span><span>.</span><span>.</span></span>
+    </div>
+  </Transition>
+</template>
+```
+
+**关键设计**：
+- **结构化类型而非字符串 phase**：用 TS `ReActProgressEvent` 联合类型约束 4 种事件，前端 `isProgressType` 类型守卫；后端写错字段会编译失败。
+- **stream-finalizer 不在进度流范围内**：进度事件只描述"ReAct 阶段发生了什么"，不含业务结果数据，与 `chunk / tool_calls / interactive_request` 职责清晰分离。
+- **状态清空时机**：`onDone` 和 `onError`（非 Abort）都会调用 `setReactProgress(null)`，指示器自动消失。
+
+### 7.2 SSE 断连自动重连 ✅ 已实现
+
+**目标**：SSE 连接断开后，前端自动重试 1-3 次，**保留已收到的 aiMsg 文本不重置**，对用户透明地完成恢复。
+
+**实现**：[useAutoReconnect.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useAutoReconnect.ts) — 一个无业务耦合的通用包装器，指数退避 1s → 2s → 4s，最多 3 次。
+
+**核心代码**：
+
+```typescript
+// useAutoReconnect.ts（已实现）
+export async function withReconnect<T>(
+  fn: () => Promise<T>,
+  opts: { signal: AbortSignal; onRetry?: (attempt: number, delayMs: number) => void },
+): Promise<T> {
+  let lastErr: unknown = null
+  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+    if (opts.signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError')
     }
+    try {
+      if (attempt > 0) isReconnecting.value = true
+      return await fn()  // 成功 → 退出
+    } catch (err) {
+      const e = err as Error
+      if (e.name === 'AbortError') throw err  // 用户中止 → 不重试
+      lastErr = err
+      if (attempt >= MAX_RETRY) break  // 3 次仍失败 → 兜底
+      const delay = BASE_DELAY_MS * Math.pow(FACTOR, attempt)
+      opts.onRetry?.(attempt + 1, delay)
+      await sleep(delay, opts.signal)  // 用户中止时 sleep 也会拒绝
+    }
+  }
+  throw lastErr
+}
+```
+
+**调用方集成**（[useSendMessage.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useSendMessage.ts#L100-L150)）：
+
+```typescript
+// 每次重连前都新建 AbortController（旧的已 abort），但 aiMsg 文本/streaming 标记都保留
+const attemptStream = async (): Promise<void> => {
+  const ac = new AbortController()
+  setAbortController(ac)
+  await sendChatStream(content, session.id, /* 9 个回调 */, ac.signal, /* ... */)
+}
+
+try {
+  await withReconnect(attemptStream, {
+    signal: abortController!.signal,
+    onRetry: (attempt, delayMs) => {
+      ElMessage.warning({ message: `连接中断，正在重试 (${attempt}/3)…`, duration: delayMs })
+    },
+  })
+} catch (err) {
+  if (err.name !== 'AbortError') {
+    aiMsg.content = aiMsg.content
+      ? aiMsg.content + `\n\n[连接失败：${err.message}]`
+      : `❌ 未知错误：${err.message}`
   }
 }
 ```
-
-前端接收 `status` 事件后，在 AI 气泡中展示一个小的状态指示器（如"🔍 正在搜索菜谱…"），替代空白的闪烁光标。
-
-### 7.2 SSE 断连自动重连 🟡 P1
-
-**现状**：SSE 连接断开后，前端直接展示错误提示，已传输的内容丢失（虽然后端已持久化，但前端消息列表中的部分内容不会恢复）。
 
 **设计要点**：
+- **幂等性**：重连时仍然使用同一个 `sessionId`，后端从 history 加载消息后重建 LLM 上下文。注意 LLM 本身非幂等——重连后的回答可能与中断前不同，这是 SSE 模型的固有限制。
+- **AbortSignal 双层**：外层 controller 让用户点停止；内层（attemptStream 内新建的）让网络错误时 dispose 旧 fetch。`withReconnect` 监听外层 signal，停止时立即跳出退避 sleep。
+- **aiMsg 不重置**：已收到的 token 全部保留在 `aiMsg.content` 中。重连的 SSE 会重新触发 ReAct 循环，但前端展示不变（新增的内容会 append 到尾部）。
+- **进度事件也会被重连覆盖**：ReAct 进度事件是 ReAct 循环开始/结束的产物，重连后 `thinking → tool_call → streaming` 会再走一遍，UI 自动同步。
 
-```
-连接断开
-    │
-    ├── 网络错误（fetch 抛出 TypeError）
-    │     → 指数退避重试：1s → 2s → 4s → 最多 3 次
-    │
-    ├── HTTP 非 200（Nginx 超时返回 504）
-    │     → 同网络错误处理
-    │
-    └── SSE error 事件（后端显式发送）
-          → 如果是业务错误（如 API Key 无效）→ 不重试，展示错误
-          → 如果是临时错误（如 API 限流 429）→ 退避重试
-```
+### 7.3 服务端心跳保活 + 客户端静默检测 ✅ 已实现
 
-**核心实现**：
+**目标**：① 后端每 15s 发一条 SSE 注释 `:heartbeat\n\n` 保活，避免被代理/防火墙静默切断；② 客户端用 30s 静默计时器检测"LLM 思考中 vs 连接已死"，区别对待。
+
+**服务端实现**（[sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/sse.ts)）：
 
 ```typescript
-// useConversation.ts — sendMessage 增强版
-async function sendMessage(content: string) {
-  const MAX_RETRIES = 3
-  const BASE_DELAY = 1000
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      const delay = BASE_DELAY * Math.pow(2, attempt - 1)
-      console.info(`[Conversation] 🔄 第 ${attempt} 次重试，等待 ${delay}ms…`)
-      await new Promise(r => setTimeout(r, delay))
-    }
-
-    try {
-      await sendChatStream(content, session.id, onChunk, onDone, onError, signal)
-      return  // 成功
-    } catch (err) {
-      if (attempt === MAX_RETRIES) throw err  // 最后一次失败，向上抛
-    }
+const heartbeatTimer = setInterval(() => {
+  if (finished || res.writableEnded) {
+    clearInterval(heartbeatTimer)
+    return
   }
+  try {
+    res.write(':heartbeat\n\n')  // SSE 注释行，浏览器忽略但 TCP 探针能识别
+  } catch (err) {
+    clearInterval(heartbeatTimer)
+  }
+}, HEARTBEAT_INTERVAL_MS)  // 15s
+
+return {
+  signal: abortController.signal,
+  markStreamed: () => { hasStreamed = true },
+  markFinished: () => { finished = true; clearInterval(heartbeatTimer) },  // 正常完成时清理
 }
 ```
 
-**重试时的注意事项**：
-- **幂等性**：用同一个 sessionId 重连，后端加载历史消息后继续推理。但 LLM 本身非幂等——可能生成不同的回答。需要在 UI 上告知用户"正在重新连接…"，且之前的 token 内容不清空。
-- **AbortSignal**：用户主动取消时不应重试，需传递取消信号。
-- **部分内容保留**：重试前不清空 `aiMsg.content`，保留已收到的部分内容。
-
-### 7.3 客户端心跳超时 🟡 P1
-
-**现状**：客户端 `fetch` 没有设置超时。如果 LLM 长时间思考（如 DeepSeek Reasoner 可能需要 30-60 秒思考时间），连接可能在静默期被中间代理断开。
-
-**实现**：在 `sendChatStream` 中增加可重置的定时器：
+**客户端实现**（[api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts)）：
 
 ```typescript
-// chat.ts — sendChatStream 增强版
-export async function sendChatStream(...) {
-  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
-  const HEARTBEAT_TIMEOUT = 120_000  // 2 分钟无数据 → 超时
-
-  function resetHeartbeat() {
-    if (heartbeatTimer) clearTimeout(heartbeatTimer)
-    heartbeatTimer = setTimeout(() => {
-      console.warn('[API] ⏰ SSE 心跳超时，120s 无数据')
-      reader?.cancel()
-      onError(new Error('连接超时：长时间未收到数据'))
-    }, HEARTBEAT_TIMEOUT)
+for (const line of lines) {
+  // P1-②：SSE 注释行 → 心跳（重置静默计时器，但不触发 UI 渲染）
+  if (line.startsWith(':')) {
+    handlers.onHeartbeat?.()
+    continue
   }
-
-  resetHeartbeat()  // 建立连接后启动
-
-  // ... 原有 while(true) 循环中 ...
-  for (const line of lines) {
-    // 每收到有效数据行就重置计时器
-    if (line.startsWith('data: ') && line.includes('"content"')) {
-      resetHeartbeat()
-    }
-    // ... 原有解析逻辑
-  }
+  // ... 原有 data: 行解析 ...
 }
 ```
 
-**关键**：每次收到 `chunk` 事件就重置计时器，区分"LLM 思考中（无 token 输出）"和"连接已死（连 TCP 都断了）"。
+**静默计时器**（[useStreamTimers.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useStreamTimers.ts)）：30s 内无数据 → 触发"卡住"提示气泡；120s 硬上限 → 强制 abort。
+
+**为什么 heartbeat 要重置静默计时器？**
+
+后端 ReAct 阶段可能要等 LLM 思考 30-60s（DeepSeek Reasoner），这段时间内没有任何 `chunk` 事件，但连接本身是健康的。如果不重置，30s 静默检测会误报。heartbeat 注释行能区分"连接存活但 LLM 慢"和"连接已死"。
 
 ### 7.4 移动端切后台断连 🟢 P2
 
@@ -834,16 +925,98 @@ function parseMarkdown() {
 
 | 阶段 | 内容 | 工作量 | 收益 |
 |------|------|--------|------|
-| ✅ 已完成 | AbortError 修复 + Markdown 节流 + 智能滚动 | 一小时代码 | 消除 P0 bug，明显性能提升 |
-| 🔜 下一批 | ReAct 中间状态反馈 + 客户端心跳超时 | 半天 | 用户感知大幅提升，消除"卡住"焦虑 |
-| 📅 后续 | SSE 断连重试 + 移动端切后台恢复 | 半天 | 弱网和移动端体验明显改善 |
-| 🔮 远期 | 增量 Markdown 解析 + Web Worker 渲染 + 虚拟滚动 | 1-2 天 | 极限场景（超长回复、超长历史）性能保障 |
+| ✅ 已完成 (P0) | AbortError 修复 + Markdown 节流 + 智能滚动 | 一小时代码 | 消除 P0 bug，明显性能提升 |
+| ✅ 已完成 (P1) | ReAct progress 事件 + 服务端 heartbeat + 客户端 auto-reconnect | 半天 | 用户感知大幅提升：实时反馈 + 长 ReAct 不卡顿 + 弱网自动恢复 |
+| 🔜 下一批 (P2) | 移动端切后台恢复 + 代码块流式闪烁 | 半天 | 移动端体验；流式 markdown 美观度 |
+| 🔮 远期 (P3) | 增量 Markdown 解析 + Web Worker 渲染 + 虚拟滚动 + DOMPurify | 1-2 天 | 极限场景（超长回复、超长历史）性能保障；XSS 防护 |
 
 ---
 
-## 九、交互式工具与续点
+## 九、P1 性能优化总结（刚完成）
+
+> 本节是对 P1 三项优化的总览性总结。详细代码与协议定义见 §7.1-§7.3。
+
+### 9.1 优化目标回顾
+
+P0 修复消除了 3 个 P0 级别的 bug（AbortError 状态、close 误触发、空内容），但**仍有 3 个体验问题**：
+
+| 问题 | 用户感知 | 业务影响 |
+|------|---------|---------|
+| **ReAct 黑盒** | 长思考时光标闪，看不到在干嘛 | 怀疑卡死，刷新页面 |
+| **长 ReAct 静默** | 30s+ 无文字，误判"卡住" | 误点停止，重发消息 |
+| **网络抖动** | 弱网/移动端切后台后断连 | 必须手动刷新 |
+
+### 9.2 端到端协议改动
+
+新增 2 类 SSE 事件，零 breaking change：
+
+```
+event: progress
+data: {"type":"thinking","step":1,"maxSteps":5}
+
+event: progress
+data: {"type":"tool_call","step":1,"toolNames":["search_recipe"]}
+
+:heartbeat
+
+:heartbeat
+```
+
+- `progress` 事件：4 种类型（`thinking` / `tool_call` / `tool_result` / `streaming`），后端 ReAct 循环中插入 4 个钩子
+- `:heartbeat`：SSE 注释行（以 `:` 开头），浏览器 EventSource 忽略但 TCP 探针能识别，每 15s 一条
+
+### 9.3 文件改动一览
+
+| 类别 | 文件 | 改动 |
+|------|------|------|
+| 后端核心 | [react-loop.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/agent/react-loop.ts) | 新增 `onProgress` 回调 + 4 处调用 |
+| 后端入口 | [agent.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/agent.ts) | `chatStream` / `resumeInteractive` 签名追加 `onProgress?` |
+| 后端 SSE | [http/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/sse.ts) | `setInterval` 写 `:heartbeat`，finished/writableEnded 时自动清理 |
+| 后端路由 | [http/routes/chat.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/routes/chat.ts) | 把 `onProgress` 转发为 `progress` SSE 事件 |
+| 前端类型 | [types/index.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/types/index.ts) | 新增 `ReActProgressEvent` 联合类型 |
+| 前端 SSE | [api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts) | 解析 `:` 注释行 + progress 事件；`SSEConsumerHandlers` 追加 `onHeartbeat` / `onProgress` |
+| 前端 hooks | [useStreamEvents.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useStreamEvents.ts) | `onHeartbeat → resetInactivityTimer`；`onProgress → setReactProgress`；onDone/onError 清空 progress |
+| 前端 hooks | [useAutoReconnect.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useAutoReconnect.ts) | **新文件** — 指数退避重连包装器 |
+| 前端 hooks | [useReActProgress.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useReActProgress.ts) | **新文件** — 暴露 progress 状态给 UI |
+| 前端 hooks | [useSendMessage.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useSendMessage.ts) | `withReconnect` 包裹；`onRetry` 触发 ElMessage 提示 |
+| 前端 hooks | [useInteractiveSubmit.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useInteractiveSubmit.ts) | 同上 |
+| 前端 UI | [ReActProgressIndicator.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/ReActProgressIndicator.vue) | **新文件** — 蓝底小指示器，200ms 淡入淡出 |
+| 前端 UI | [MessageBubble/index.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/index.vue) | `streaming` 时渲染 `<ReActProgressIndicator />` |
+
+### 9.4 关键设计决策
+
+| 决策 | 选项 A | 选项 B（采纳） | 理由 |
+|------|--------|----------------|------|
+| progress 事件字段 | 字符串 `phase: 'reasoning'` + `detail: '正在思考第 1 步…'` | 结构化 `type: 'thinking'` + `step: 1` + `maxSteps: 5` | TS 联合类型可约束，UI 渲染逻辑可分支处理，避免字符串拼接 |
+| 心跳方向 | 客户端 → 服务端（ping） | 服务端 → 客户端（`:` 注释行） | 后端单源触发更可靠；客户端只被动接收并重置静默计时器 |
+| 重连策略 | 简单 setTimeout 重试 | `useAutoReconnect` 包装器 + 指数退避 | 包装器与业务解耦，可复用到 `useInteractiveSubmit`；睡眠可被 AbortSignal 中断 |
+| AbortSignal 层级 | 单层 | 双层（外层 useStopGeneration / 内层 attemptStream 每次新建） | 重连时旧 fetch 已死，必须用新 controller；外层让用户随时一键停止 |
+| aiMsg 文本处理 | 重连时清空 + 重新生成 | **保留不重置** | 用户能继续看到已收到的部分内容，体感"无感恢复" |
+| progress 状态存储 | Pinia store | 模块级 ref + 单例 ref 暴露 | 同时间只有一个流在跑，避免污染 store 概念边界 |
+
+### 9.5 验证
+
+- ✅ 前端 `vue-tsc --noEmit` 0 错误
+- ✅ 前端 `vite build` 成功（17.4s，dist 产物正常）
+- ✅ 后端 `tsc --noEmit` 非测试代码 0 错误（`__tests__/refactor-modules.test.ts` 预存错误与本任务无关）
+
+### 9.6 可观测的体感提升
+
+| 场景 | P0 修复后 | P1 优化后 |
+|------|----------|----------|
+| 问"红烧肉怎么做"（需要搜菜谱） | 8-10s 静默期 → 突然出现 200 字回答 | 0s: "🧠 正在推理第 1 / 5 步…" → 1s: "🔧 正在调用 search_recipe…" → 2s: 回答开始 |
+| 弱网（手机 4G 切换 WiFi） | 断连报错，必须手动重发 | ElMessage "连接中断，正在重试 (1/3)…" → 2s 后自动续传 |
+| LLM 思考 40s（Reasoner 模型） | 30s 后弹"卡住"提示，120s 后超时 | 0s/15s/30s 收到 heartbeat 注释行，静默计时器持续重置 |
+| 移动端切后台 1 分钟 | 切回后 SSE 已死，必须刷新 | 同弱网，自动重连 1-3 次 |
+
+---
+
+
+## 十、交互式工具与续点
 
 > 厨神小助已支持"人机协作"工具调用：LLM 主动把决策权交还用户，本节介绍完整实现。
+>
+> 📘 **深入原理**：本节聚焦前端流程与状态机，后端 12 个底层原理（OpenAI 协议约束 / `INTERACTIVE_TOOL_NAMES` / `handleToolCalls` 顺序敏感性 / AbortSignal 重置 / LLM"记忆错觉" / 上下文截断对续点的影响 / SSE 三标记守卫）请参见 [interactive-dialogue-deep-dive.md](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/interactive-dialogue-deep-dive.md)。
 
 ### 9.1 设计目标
 

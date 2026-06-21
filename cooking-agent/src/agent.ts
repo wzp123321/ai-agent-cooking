@@ -28,23 +28,34 @@ import { TOOL_LIST, executeTools, INTERACTIVE_TOOL_NAMES } from './tools'
 import { sessionRepo } from './db/session.repository'
 import { messageRepo } from './db/message.repository'
 import { userProfileRepo } from './db/user-profile.repository'
+import { choiceRepo } from './db/choice-history.repository'
 import { getProvider, type LLMProvider } from './llm'
 import type { Message, ChatResult } from './types'
 import type { ToolCall, ReActStep } from './tools/types'
 import type { ChatCompletionResult } from './llm/types'
+import { parseInteractiveArgs, validateChoice, SKIP_SENTINEL } from './agent/interactive'
+import type { InteractiveRequest } from './agent/interactive'
+import { buildPreferencesPrompt } from './agent/preferences'
+import { runReActLoop, type ReActLoopResult } from './agent/react-loop'
+import { finalize } from './agent/stream-finalizer'
+
+// 重新导出交互式类型给上层使用
+export type { InteractiveRequest, InteractiveRequestEvent, InteractiveType } from './agent/interactive'
 
 /**
- * 交互式请求 — Agent 在 ReAct 循环中检测到 ask_user_choice 工具时，
- * 不会执行它，而是通过此结构把问题/选项交给前端展示。
+ * 兼容：以下类型/接口已迁移到 agent/interactive 模块
+ *   - InteractiveType           → agent/interactive/constants.ts
+ *   - InteractiveRequest        → agent/interactive/schema.ts
+ *   - parseInteractiveArgs()    → agent/interactive/parser.ts
+ *   - validateChoice()          → agent/interactive/validator.ts
  *
- * id 与 LLM 下发的 tool_call.id 一一对应，前端回传选择时也带此 id。
+ * 这里不再重复定义，从 './agent/interactive' 导入。
+ *
+ * P-重构：以下逻辑已拆出 agent.ts
+ *   - 后台超时清理：   agent/timeout-watcher.ts
+ *   - ReAct 循环体：   agent/react-loop.ts
+ *   - 流式收尾：       agent/stream-finalizer.ts
  */
-export interface InteractiveRequest {
-  id: string
-  question: string
-  options: string[]
-  multiSelect: boolean
-}
 
 const MAX_REACT_STEPS = 5
 const MAX_RETRIES = 3
@@ -98,7 +109,8 @@ export class CookingAgent {
       await sessionRepo.create(sessionId, '新对话', now)
 
       const profilePrompt = await userProfileRepo.buildProfilePrompt()
-      const systemContent = buildSystemMessage() + profilePrompt
+      const preferencesPrompt = await buildPreferencesPrompt(sessionId)
+      const systemContent = buildSystemMessage() + profilePrompt + preferencesPrompt
 
       const systemMsg: Message = { role: 'system', content: systemContent }
       await messageRepo.insert(sessionId, systemMsg, now)
@@ -106,12 +118,81 @@ export class CookingAgent {
     }
 
     const rows = await messageRepo.findBySessionId(sessionId)
-    const messages: Message[] = rows.map((r) => ({
+    const rawMessages: Message[] = rows.map((r) => ({
       role: r.role as Message['role'],
       content: r.content,
       tool_call_id: r.tool_call_id ?? undefined,
       tool_calls: r.tool_calls ? JSON.parse(r.tool_calls) : undefined,
     }))
+
+    /**
+     * P-修复-2：处理 assistant(tool_calls) 缺失 tool 响应的情况。
+     *
+     * 背景：pre-fix 时代 `handleToolCalls` 只持久化 assistant 消息（带 N 个
+     * tool_calls）但 0 条 tool 消息。修复后的版本会写占位 tool 消息，
+     * 但**历史脏数据**（pre-fix 时代创建的 session）里已经有 N 个 tool_calls
+     * 但 0 条 tool 响应的 assistant 消息。
+     *
+     * 症状：用户复用这类老 session 时，第一次 LLM 调用即报 400：
+     *   "An assistant message with 'tool_calls' must be followed by tool
+     *    messages responding to each 'tool_call_id'."
+     *
+     * 修复：在 loadMessages 阶段，对每条 assistant(tool_calls) 消息扫描其后的
+     * tool 响应（直到下一个 assistant/user），缺失的 tool_call_id 在内存中
+     * 合成占位 tool 消息插入。**DB 不动**（保留前端 UI 状态，脏数据后续
+     * 一次性迁移脚本清理）。
+     */
+    const seenToolCallIds = new Set<string>()
+    const messages: Message[] = []
+    let dropped = 0
+    let synthesized = 0
+    for (const m of rawMessages) {
+      if (m.role === 'assistant' && m.tool_calls) {
+        for (const tc of m.tool_calls) seenToolCallIds.add(tc.id)
+      }
+      if (m.role === 'tool' && m.tool_call_id && !seenToolCallIds.has(m.tool_call_id)) {
+        dropped++
+        continue
+      }
+      messages.push(m)
+
+      // 检查这条 assistant 消息之后是否所有 tool_call 都有响应，
+      // 缺失则在内存中合成占位 tool 消息。
+      if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+        const respondedIds = new Set<string>()
+        for (let j = messages.length; j < rawMessages.length; j++) {
+          const mm = rawMessages[j]
+          if (mm.role === 'tool' && mm.tool_call_id) respondedIds.add(mm.tool_call_id)
+          else if (mm.role === 'assistant' || mm.role === 'user') break
+        }
+        for (const tc of m.tool_calls) {
+          if (!respondedIds.has(tc.id)) {
+            // 内存中合成占位 tool 消息
+            const synth: Message = {
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: JSON.stringify({
+                status: 'synthesized_legacy',
+                tool_name: tc.function.name,
+                hint: '历史脏数据：pre-fix 时代 assistant(tool_calls) 未补 tool 响应，已在内存中合成占位以保证 LLM 协议合法',
+              }),
+            }
+            messages.push(synth)
+            synthesized++
+          }
+        }
+      }
+    }
+    if (dropped > 0) {
+      console.warn(
+        `[Session] ⚠️ 加载 [${sessionId}] 时丢弃 ${dropped} 条孤儿 tool 消息（缺对应 assistant(tool_calls)）`,
+      )
+    }
+    if (synthesized > 0) {
+      console.warn(
+        `[Session] 🛠️ 加载 [${sessionId}] 时为 ${synthesized} 个历史 tool_call_id 合成占位 tool 消息（仅内存，DB 未修改）`,
+      )
+    }
 
     console.info(`[Session] 📂 加载会话 ${sessionId}：${messages.length} 条消息`)
 
@@ -143,6 +224,27 @@ export class CookingAgent {
     await messageRepo.insert(sessionId, msg, Date.now())
   }
 
+  /**
+   * P1-7：构造"用户偏好"段，注入 system prompt。
+   * P3-13：拆分为"本会话" + "跨会话"两段。
+   *
+   * 行为：
+   *   - 本会话：getTopByCategory({sessionId}) — 反映用户在当前会话已表达的偏好
+   *   - 跨会话：getTopByCategoryAcrossSessions() — 反映用户在其他会话的历史习惯
+   *   - 时间窗口：默认 90 天（避免远古数据干扰）
+   *   - 拼接为中文描述，例：
+   *       "用户偏好历史：
+   *        本会话：饮食目标：减脂(2次), 控糖(1次)
+   *        跨会话：菜系偏好：川菜(8次), 粤菜(3次)"
+   *
+   * 注意事项：
+   *   - 不在这里做"个性化过滤"——只把数据交给 LLM，由 LLM 决定如何利用
+   *   - 拼接到 system prompt 而非 user prompt，避免污染用户消息历史
+   *   - 跨会话部分加"仅供参考"标签，避免 LLM 把历史偏好当成当前命令
+   *
+   * 实现：已迁移到 ./agent/preferences/prompt.ts（避免 agent.ts 越长越大）
+   */
+
   async listSessions() {
     return sessionRepo.findAll()
   }
@@ -155,6 +257,145 @@ export class CookingAgent {
 
   async getHistory(sessionId: string): Promise<Message[]> {
     return messageRepo.findHistoryBySessionId(sessionId)
+  }
+
+  /**
+   * P1-8 引入：用户主动取消"待回答的交互式请求"。
+   *
+   * 触发场景：
+   *   - 前端交互卡片上显示"跳过"或"不想回答"按钮
+   *   - 用户在 10 分钟后直接放弃等答
+   *
+   * 行为：
+   *   - 校验 sessionId + interactiveId 与 pending 一致
+   *   - 清除 session.pending_interactive 字段
+   *   - 同步写入 tool 消息（content: { skipped: true, reason: 'user_cancelled' }）
+   *     让 LLM 在下一轮知道"用户放弃了那个问题"
+   *   - 返回 { cancelled, currentPending } 给调用方
+   *
+   * 失败处理：
+   *   - session 不存在 → 抛 404
+   *   - pending 不存在 → 返回 { cancelled: false, reason: 'no_pending' }
+   *   - pending.id 与请求的 interactiveId 不一致 → 返回 { cancelled: false, reason: 'id_mismatch' }
+   */
+  async cancelInteractive(
+    sessionId: string,
+    interactiveId: string,
+  ): Promise<{ cancelled: boolean; reason?: string; remaining?: number }> {
+    console.info(`[Agent] 🛑 取消交互 [${sessionId}]：interactiveId=${interactiveId}`)
+
+    const session = await sessionRepo.findById(sessionId)
+    if (!session) {
+      throw new Error(`会话 ${sessionId} 不存在`)
+    }
+
+    // P1-4 改动：支持取消数组中任意一项
+    const pendingList = await sessionRepo.getPendingInteractiveList(sessionId)
+    if (pendingList.length === 0) {
+      console.info(`[Agent] ℹ️ 会话 [${sessionId}] 当前无 pending_interactive，无需取消`)
+      return { cancelled: false, reason: 'no_pending' }
+    }
+
+    const exists = pendingList.some((p) => p.id === interactiveId)
+    if (!exists) {
+      console.warn(
+        `[Agent] ⚠️ 取消的 interactiveId=${interactiveId} 不在 pending 列表中：[${pendingList.map((p) => p.id).join(', ')}]`,
+      )
+      return { cancelled: false, reason: 'id_mismatch' }
+    }
+
+    // 写入 tool 消息，让 LLM 在下次 LLM 调用时知道"用户放弃了那个问题"
+    //   注意：这条 tool 消息是必要的，LLM 协议要求 assistant(tool_calls) 后必须跟 tool 消息
+    const cancelMsg: Message = {
+      role: 'tool',
+      tool_call_id: interactiveId,
+      content: JSON.stringify({ user_choice: null, skipped: true, reason: 'user_cancelled' }),
+    }
+    await this.persistMessage(sessionId, cancelMsg)
+
+    // 从 pending 数组中移除（若全部移除则清空）
+    await sessionRepo.removePendingInteractive(sessionId, interactiveId, Date.now())
+
+    const remaining = (await sessionRepo.getPendingInteractiveList(sessionId)).length
+    console.info(`[Agent] ✅ 交互 [${sessionId}] 已取消：${interactiveId}（剩余 ${remaining} 个）`)
+    return { cancelled: true, remaining }
+  }
+
+  /**
+   * P3-15：撤销最近一次"已回答"的交互式工具。
+   *
+   * 行为：
+   *   1. 找到最近一次 assistant(tool_calls=[ask_user_choice]) + tool 消息对
+   *   2. 删除 tool 消息（用户的选择）
+   *   3. 把 ask_user_choice 加回 pending_interactive（让前端可以重新选）
+   *   4. 返回 interactive_id，前端可调用 /api/chat/resume 或重新渲染
+   *
+   * 限制：
+   *   - 只撤销最近一次
+   *   - LLM 不会主动重发问（避免破坏对话节奏）；前端可调 /api/chat/continue 触发
+   *   - 撤销后不删除 user_choice_history 中的记录（保留作为历史统计）
+   */
+  async undoLastInteractive(sessionId: string): Promise<{
+    undone: boolean
+    interactiveId?: string
+    reason?: string
+  }> {
+    console.info(`[Agent] ↩️ 撤销最近交互 [${sessionId}]`)
+
+    const session = await sessionRepo.findById(sessionId)
+    if (!session) {
+      throw new Error(`会话 ${sessionId} 不存在`)
+    }
+
+    const pair = await messageRepo.findLastAnsweredInteractive(sessionId)
+    if (!pair) {
+      console.info(`[Agent] ℹ️ 会话 [${sessionId}] 没有可撤销的交互`)
+      return { undone: false, reason: 'no_answered_interactive' }
+    }
+
+    // 1) 删除 tool 消息
+    await messageRepo.deleteById(pair.toolId)
+    console.info(`[Agent] 🗑️  删除 tool 消息 id=${pair.toolId}`)
+
+    // 2) 把 ask_user_choice 加回 pending_interactive
+    //    需要从 assistant 消息的 tool_calls 中找到对应 args
+    const rows = await messageRepo.findBySessionId(sessionId)
+    const assistantRow = rows.find((r) => r.id === pair.assistantId)
+    if (!assistantRow || !assistantRow.tool_calls) {
+      return { undone: false, reason: 'assistant_message_missing' }
+    }
+    type AskTc = { id?: string; function?: { name?: string; arguments?: string } }
+    const tcs = JSON.parse(assistantRow.tool_calls) as AskTc[]
+    const askTc = tcs.find((tc) => tc.id === pair.interactiveId)
+    if (!askTc || !askTc.function?.arguments) {
+      return { undone: false, reason: 'tool_call_args_missing' }
+    }
+
+    const interactive = parseInteractiveArgs(pair.interactiveId, askTc.function.arguments)
+    if (!interactive) {
+      return { undone: false, reason: 'parse_failed' }
+    }
+
+    // 追加到 pending_interactive（若已存在则不重复加）
+    const now = Date.now()
+    const list = await sessionRepo.getPendingInteractiveList(sessionId)
+    if (!list.some((p) => p.id === pair.interactiveId)) {
+      const updated = [
+        ...list,
+        {
+          id: interactive.id,
+          name: 'ask_user_choice',
+          arguments: askTc.function.arguments,
+          created_at: now,
+        },
+      ]
+      await sessionRepo.setPendingInteractiveList(sessionId, updated, now)
+      console.info(`[Agent] ✅ 交互 [${pair.interactiveId}] 已回到 pending 列表`)
+    } else {
+      console.info(`[Agent] ℹ️ 交互 [${pair.interactiveId}] 已在 pending 列表中，跳过添加`)
+    }
+
+    return { undone: true, interactiveId: pair.interactiveId }
   }
 
   // ─── LLM 调用（带重试）───────────────────────────────────
@@ -260,7 +501,7 @@ export class CookingAgent {
 
     for (const c of assistantToolCalls) {
       if (INTERACTIVE_TOOL_NAMES.has(c.function.name)) {
-        const req = this.parseInteractiveArgs(c.id, c.function.arguments)
+        const req = parseInteractiveArgs(c.id, c.function.arguments)
         if (req) {
           interactiveRequests.push(req)
         }
@@ -316,46 +557,112 @@ export class CookingAgent {
         observation: '⏸️ 已暂停，等待用户在前端选择',
       })
 
+      /**
+       * P0-2 修复：把待回答的交互式工具写入 session 级别。
+       * P1-4 改动：写为数组，支持同轮多个交互式工具。
+       *
+       * 原因：loadMessages 在 messages.length > MAX_CONTEXT_MESSAGES 时会截断，
+       * 原 assistant(tool_calls) 消息可能被移除，resumeInteractive 反查不到。
+       * 把 { id, name, arguments } 额外存到 session 行，保证续点时能找回。
+       *
+       * 多交互式工具场景（P1-4）：
+       *   - LLM 同轮调起 2 个 ask_user_choice
+       *   - 全部写入数组
+       *   - 前端收到多个 interactive_request 事件，渲染多张卡片
+       *   - 用户逐个回答，每答一个 → 调一次 /api/chat/continue
+       *   - 全部答完后数组清空，ReAct 继续
+       */
+      const pendingList = interactiveRequests
+        .map((req) => {
+          const tc = assistantToolCalls.find((c) => c.id === req.id)
+          if (!tc) return null
+          return {
+            id: req.id,
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+            created_at: Date.now(),
+          }
+        })
+        .filter((p): p is NonNullable<typeof p> => p !== null)
+
+      if (pendingList.length > 0) {
+        try {
+          await sessionRepo.setPendingInteractiveList(sessionId, pendingList, Date.now())
+          console.info(`[Agent] 💾 已写入 ${pendingList.length} 个 pending_interactive [${sessionId}]`)
+        } catch (err) {
+          console.warn(`[Agent] ⚠️ 写入 pending_interactive 失败（不影响主流程）：`, (err as Error).message)
+        }
+      }
+
       // 依次通过回调下发到前端（前端会为每个请求渲染一个交互卡片）
       for (const req of interactiveRequests) {
         onInteractive?.(req)
       }
+
+      /**
+       * P-修复：为每个交互式 tool_call_id 立即写一条"占位" tool 消息。
+       *
+       * OpenAI 协议要求：assistant(tool_calls) 中每个 tool_call_id 必须有 1 条
+       * 对应的 tool 消息响应，否则 LLM 会 400 报错：
+       *   "An assistant message with 'tool_calls' must be followed by tool
+       *    messages responding to each 'tool_call_id'."
+       *
+       * 多交互式工具场景：LLM 同轮调起 N 个 ask_user_choice 时，
+       * 之前的实现只持久化 assistant 消息（带 N 个 tool_calls）但 0 条 tool 消息，
+       * 用户回答 1 个时 resume 追加 1 条 → 仍然有 N-1 个 tool_call_id 悬空 → 400。
+       *
+       * 现在：handleToolCalls 阶段就为每个交互式 tool_call 写占位消息，
+       * 用户回答时 resumeInteractive 用 updateToolContentByCallId 把占位
+       * 消息的 content 替换为最终选择（保持 1对1 关系）。
+       */
+      for (const req of interactiveRequests) {
+        const placeholderMsg: Message = {
+          role: 'tool',
+          tool_call_id: req.id,
+          content: JSON.stringify({
+            status: 'pending_user_choice',
+            question: req.question,
+            hint: '等待用户在前端做出选择',
+          }),
+        }
+        messages.push(placeholderMsg)
+        await this.persistMessage(sessionId, placeholderMsg)
+      }
+      console.info(
+        `[Agent] 📝 [fix] 为 ${interactiveRequests.length} 个交互式 tool_call 写占位 tool 消息`,
+      )
+
+      // #region debug-point check-tool-pairing
+      console.info(`[Agent] 🔎 [debug] handleToolCalls 退出前 messages 校验：`)
+      for (let i = 0; i < messages.length; i++) {
+        const m = messages[i]
+        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+          const callIds = m.tool_calls.map((tc) => tc.id)
+          const respondedIds = new Set<string>()
+          for (let j = i + 1; j < messages.length; j++) {
+            const mm = messages[j]
+            if (mm.role === 'tool' && mm.tool_call_id) respondedIds.add(mm.tool_call_id)
+            else if (mm.role === 'assistant') break
+          }
+          const missing = callIds.filter((id) => !respondedIds.has(id))
+          if (missing.length > 0) {
+            console.warn(
+              `[Agent] ❌ [debug] assistant 消息 (i=${i}) ${callIds.length} 个 tool_calls，缺失响应：${missing.join(',')}`,
+            )
+          } else {
+            console.info(
+              `[Agent] ✅ [debug] assistant 消息 (i=${i}) ${callIds.length} 个 tool_calls 全部有响应`,
+            )
+          }
+        }
+      }
+      // #endregion
     }
 
     return {
       toolCount: executableCalls.length,
       paused: interactiveRequests.length > 0,
       interactiveRequests,
-    }
-  }
-
-  /**
-   * 解析 ask_user_choice 的参数为结构化 InteractiveRequest。
-   * 容错：参数缺失、JSON 解析失败时退化为"无选项"的占位请求，
-   * 避免因 LLM 输出不规范导致整条 SSE 流崩掉。
-   */
-  private parseInteractiveArgs(id: string, argsStr: string): InteractiveRequest | null {
-    try {
-      const args = JSON.parse(argsStr) as {
-        question?: string
-        options?: string[]
-        multi_select?: boolean
-      }
-      const question = typeof args.question === 'string' ? args.question : '请选择'
-      const options = Array.isArray(args.options)
-        ? args.options.filter((o): o is string => typeof o === 'string')
-        : []
-      const multiSelect = args.multi_select === true
-
-      if (options.length === 0) {
-        console.warn(`[Agent] ⚠️ 交互式工具 ${id} 选项为空，跳过`)
-        return null
-      }
-
-      return { id, question, options, multiSelect }
-    } catch (err) {
-      console.error(`[Agent] ❌ 解析交互式工具参数失败 [${id}]：`, (err as Error).message)
-      return null
     }
   }
 
@@ -448,32 +755,18 @@ export class CookingAgent {
    *
    * 这是 Agent 最核心的对外接口，完成 ReAct 推理循环 + 流式回答生成。
    *
-   * @param userMessage   — 用户输入文本
-   * @param sessionId     — 会话 ID，用于加载/持久化消息历史
-   * @param onChunk       — 逐 token 回调，每个 delta 触发一次（前端实现打字机效果）
-   * @param onDone        — 完成回调，包含完整回答文本（前端停止 streaming 状态）
-   * @param signal        — 中止信号，由 index.ts 的 AbortController 传入。
-   *                        检测时机：① ReAct 每轮循环开始前 ② LLM 流式输出的每个 chunk 之间
-   * @param onInteractive — 交互式工具触发回调（可选，接收 InteractiveRequest）
-   *                        当 LLM 调起 ask_user_choice 时触发，调用方应通过 SSE 下发到前端
-   *                        并结束本轮流（不调 onDone），等 /api/chat/continue 端点接管
+   * P-重构：循环体已抽到 agent/react-loop.ts，收尾抽到 agent/stream-finalizer.ts。
+   *         本方法只负责：
+   *           ① 加载历史 / 追加用户消息 / 清理残留 pending
+   *           ② 把方法（callLLM/streamLLM/handleTools）注入到 ReAct 循环
+   *           ③ 把 ReAct 结果转给 finalize
    *
-   * 流程概览：
-   *   1. 加载历史消息 → 追加用户消息
-   *   2. 进入 ReAct 循环（最多 MAX_REACT_STEPS 轮）
-   *      a. 每轮开始前检查 signal.aborted
-   *      b. 调用 LLM（带 3 次重试）
-   *      c. 如有 tool_calls → 执行非交互式工具 + 处理交互式工具 → 继续或暂停
-   *      d. 如无 tool_calls → 进入流式回答阶段 → break
-   *   3. 流式回答阶段
-   *      a. 调用 llm.chatCompletionStream({ stream: true })
-   *      b. 每个 chunk 检查 signal.aborted
-   *      c. 通过 onChunk 回调推送增量文本
-   *   4. 后处理
-   *      a. 中止 → 保存部分结果 + onDone
-   *      b. 暂停（等待用户）→ 不调 onDone，调用方应 res.end()
-   *      c. 空回答 → 发送兜底文案
-   *      d. 正常 → 持久化完整消息 + onDone
+   * @param userMessage   — 用户输入文本
+   * @param sessionId     — 会话 ID
+   * @param onChunk       — 逐 token 回调
+   * @param onDone        — 完成回调
+   * @param signal        — 中止信号
+   * @param onInteractive — 交互式工具触发回调（可选）
    */
   async chatStream(
     userMessage: string,
@@ -482,131 +775,76 @@ export class CookingAgent {
     onDone: (fullContent: string) => void,
     signal?: AbortSignal,
     onInteractive?: (req: InteractiveRequest) => void,
+    /**
+     * P1-①：ReAct 阶段进度回调（前端用它渲染"正在思考/调用工具"指示器）。
+     * 不传则降级为不发送（向后兼容）。
+     */
+    onProgress?: import('./agent/react-loop').ReActProgressEventCallback,
   ): Promise<void> {
     const messages = await this.loadMessages(sessionId)
     await this.prependUserMessage(messages, sessionId, userMessage)
 
-    let fullContent = ''
-    let totalToolCalls = 0
-    let cancelled = false
-    let paused = false
-    const reactLog: ReActStep[] = []
-
+    /**
+     * P0-2 修复：用户发起新一轮 chatStream 时，清除任何残留的 pending_interactive。
+     * （注释略，详见原版本）
+     */
     try {
-      for (let step = 1; step <= MAX_REACT_STEPS; step++) {
-        // 每轮推理前检查中止信号
-        if (signal?.aborted) {
-          cancelled = true
-          console.info(`[Agent] 🛑 检测到中止信号，ReAct 第 ${step} 轮前退出`)
-          break
-        }
-
-        console.info(`[Agent] 🧠 ReAct 推理第 ${step} 步...`)
-
-        const response = await this.callLLMWithRetry(messages)
-
-        const assistantContent = response.content
-        const assistantToolCalls = response.tool_calls
-
-        if (assistantToolCalls && assistantToolCalls.length > 0) {
-          const result = await this.handleToolCalls(
-            messages, sessionId, assistantContent, assistantToolCalls, reactLog, step,
-            onInteractive,
-          )
-          totalToolCalls += result.toolCount
-          if (result.paused) {
-            paused = true
-            console.info('[Agent] ⏸️  因交互式工具暂停，等待 /api/chat/continue 恢复')
-            break
-          }
-        } else {
-          console.info(`[Agent] 🔄 第 ${step} 轮 LLM 返回最终回答，进入流式输出阶段`)
-
-          await this.llm.chatCompletionStream(
-            {
-              messages: messages as any,
-              temperature: 0.7,
-              max_tokens: 2048,
-            },
-            (chunk) => {
-              fullContent += chunk
-              onChunk(chunk)
-            },
-            () => {
-              console.info(`[Agent] ✅ 流式回答完成（${fullContent.length} 字符）`)
-            },
-            (err) => {
-              console.error(`[Agent] ❌ 流式回答出错：${err.message}`)
-            },
-            signal,
-          )
-
-          if (signal?.aborted) {
-            cancelled = true
-            console.info(`[Agent] 🛑 流式输出中被中止，已生成 ${fullContent.length} 字符`)
-          }
-
-          break
-        }
+      const oldPending = await sessionRepo.getPendingInteractive(sessionId)
+      if (oldPending) {
+        console.info(`[Agent] 🧹 新一轮对话开始，清除残留 pending_interactive [${sessionId}]：${oldPending.id}`)
+        await sessionRepo.clearPendingInteractive(sessionId, Date.now())
       }
+    } catch (err) {
+      console.warn(`[Agent] ⚠️ 清除残留 pending_interactive 失败（不影响主流程）：`, (err as Error).message)
+    }
 
-      // ── 处理中止场景 ─────────────────────────────────────
-      // ① 有部分内容 → 追加 [已中止] 标记
-      // ② 无任何内容 → 发送友好提示语，避免前端收到空回答
-      // 两种情况下均持久化消息，确保刷新后仍可见
-      if (cancelled) {
-        console.info(`[Agent] 🛑 流式对话已中止 [${sessionId}]，已生成 ${fullContent.length} 字符`)
+    const outcome = await runReActLoop(messages, {
+      callLLM: (m) => this.callLLMWithRetry(m),
+      streamLLM: (m, onC, onD, onE, sig) =>
+        this.llm.chatCompletionStream(
+          { messages: m as any, temperature: 0.7, max_tokens: 2048 },
+          (chunk) => {
+            onC(chunk)
+            onChunk(chunk)
+          },
+          onD,
+          onE,
+          sig,
+        ),
+      handleTools: (assistantContent, toolCalls, step) =>
+        this.handleToolCalls(
+          messages, sessionId, assistantContent, toolCalls, [], step, onInteractive,
+        ).then((r) => ({ toolCount: r.toolCount, paused: r.paused })),
+      onInteractive,
+      onProgress,
+      signal,
+      maxSteps: MAX_REACT_STEPS,
+      logTag: 'stream',
+    })
 
-        if (fullContent.length > 0) {
-          fullContent += '\n\n[已中止]'
-        } else {
-          fullContent = '请求已被中断，请重试。'
-        }
+    await finalize(this.toFinalizeOutcome(outcome), {
+      messages,
+      sessionId,
+      onDone,
+      persist: (sid, msg) => this.persistMessage(sid, msg),
+      logTag: 'stream',
+    })
+  }
 
-        const partialMsg: Message = { role: 'assistant', content: fullContent }
-        messages.push(partialMsg)
-        await this.persistMessage(sessionId, partialMsg)
-
-        onDone(fullContent)
-        return
-      }
-
-      // ── 处理交互式工具暂停场景 ───────────────────────────
-      // 进入此分支说明 LLM 调起了 ask_user_choice，工具结果（用户的选项）尚未到达。
-      // 不调 onDone —— 调用方（index.ts）收到 onInteractive 事件后应 res.end()，
-      // 等前端调用 /api/chat/continue 时再由 resumeInteractive() 恢复。
-      if (paused) {
-        this.logReActSummary(reactLog, totalToolCalls)
-        console.info(`[Agent] ⏸️  流式对话已暂停 [${sessionId}]，等待用户选择后由 /api/chat/continue 接管`)
-        return
-      }
-
-      // ── 处理空回答场景 ───────────────────────────────────
-      // 触发条件：LLM 未生成任何文本（极少见，通常由 API 异常导致）
-      // 处理方式：返回兜底文案，避免前端显示空消息
-      if (fullContent.length === 0) {
-        console.warn(`[Agent] ⚠️ 流式回答无内容 [${sessionId}]，使用兜底文案`)
-        const fallback = '抱歉，这个问题比较复杂，我已经尽力思考了。请您换个更具体的问题。'
-        const fallbackMsg: Message = { role: 'assistant', content: fallback }
-        messages.push(fallbackMsg)
-        await this.persistMessage(sessionId, fallbackMsg)
-        onDone(fallback)
-        return
-      }
-
-      // ── 正常完成 ──────────────────────────────────────────
-      const answerMsg: Message = { role: 'assistant', content: fullContent }
-      messages.push(answerMsg)
-      await this.persistMessage(sessionId, answerMsg)
-
-      this.logReActSummary(reactLog, totalToolCalls)
-      console.info(`[Agent] ✅ 流式对话已完成 [${sessionId}]（${fullContent.length} 字符，${totalToolCalls} 次工具调用）`)
-      onDone(fullContent)
-
-    } catch (error) {
-      console.error(`[Agent] ❌ 流式调用失败 [${sessionId}]：${(error as Error).message}`)
-      console.error(`[Agent] 📋 失败时已生成 ${fullContent.length} 字符，${totalToolCalls} 次工具调用`)
-      throw error
+  /**
+   * 把 ReActLoopResult 转成 FinalizeOutcome
+   * （小工具方法，类型层桥接）
+   */
+  private toFinalizeOutcome(r: ReActLoopResult): import('./agent/stream-finalizer').FinalizeOutcome {
+    switch (r.kind) {
+      case 'done':
+        return { kind: 'done', fullContent: r.fullContent, totalToolCalls: r.totalToolCalls, reactLog: r.reactLog }
+      case 'empty':
+        return { kind: 'empty', totalToolCalls: r.totalToolCalls, reactLog: r.reactLog }
+      case 'paused':
+        return { kind: 'paused', totalToolCalls: r.totalToolCalls, reactLog: r.reactLog }
+      case 'cancelled':
+        return { kind: 'cancelled', partialContent: r.partialContent }
     }
   }
 
@@ -626,20 +864,21 @@ export class CookingAgent {
   /**
    * resumeInteractive — 用户在前端点击选项后，调用此方法恢复 ReAct 循环
    *
-   * 流程：
-   *   1. 加载历史消息（与 chatStream 一致，会触发 system prompt 初始化与上下文截断）
-   *   2. 找到上一轮助手消息中 tool_call_id === interactiveId 的那个调用
-   *   3. 追加一条 role='tool' 的消息，content 包含用户的选择
-   *   4. 继续 ReAct 循环（最多 MAX_REACT_STEPS 步）—— 这是 chatStream 内层循环的复用
-   *   5. 期间如果再次遇到 ask_user_choice → 再次通过 onInteractive 暂停
-   *   6. 期间如果 LLM 产出最终文本 → 走流式输出 + onDone
+   * P-重构：循环体 / 收尾都抽到了 agent/react-loop.ts + agent/stream-finalizer.ts。
+   *         本方法只负责"恢复前的上下文准备"：
+   *           ① 加载历史
+   *           ② 找到上一轮的 tool_call（messages / session.pending 双路兜底）
+   *           ③ 校验 choice（防脏数据 / 跳过支持）
+   *           ④ 记录偏好历史
+   *           ⑤ 移除 pending、追加 tool 消息
+   *           ⑥ 调 runReActLoop + finalize
    *
    * @param sessionId      — 会话 ID
-   * @param interactiveId  — 上一轮 ask_user_choice 的 tool_call_id（用于定位）
-   * @param choice         — 用户选择的选项（字符串数组，单选时只有一个元素）
+   * @param interactiveId  — 上一轮 ask_user_choice 的 tool_call_id
+   * @param choice         — 用户选择的选项
    * @param onChunk        — 流式输出回调
    * @param onDone         — 流结束回调
-   * @param onInteractive  — 再次触发交互式工具时的回调（用户可能再被问一次）
+   * @param onInteractive  — 再次触发交互式工具时的回调
    * @param signal         — AbortSignal
    */
   async resumeInteractive(
@@ -650,6 +889,10 @@ export class CookingAgent {
     onDone: (fullContent: string) => void,
     onInteractive: (req: InteractiveRequest) => void,
     signal?: AbortSignal,
+    /**
+     * P1-①：ReAct 阶段进度回调（与 chatStream 同义）。
+     */
+    onProgress?: import('./agent/react-loop').ReActProgressEventCallback,
   ): Promise<void> {
     console.info(`[Agent] ▶️ 恢复交互 [${sessionId}]：interactiveId=${interactiveId}, choice=${JSON.stringify(choice)}`)
 
@@ -663,8 +906,6 @@ export class CookingAgent {
       if (m.role === 'assistant' && m.tool_calls) {
         for (const tc of m.tool_calls) {
           if (tc.id === interactiveId) {
-            // tool_calls 元素是 OpenAI 协议结构 { id, type, function: { name, arguments } }
-            // 展平为 { id, name, arguments } 方便后续拼接 tool 消息
             targetCall = { id: tc.id, name: tc.function.name, arguments: tc.function.arguments }
             break
           }
@@ -673,6 +914,22 @@ export class CookingAgent {
       }
     }
 
+    // P0-2 修复：messages 找不到时回退到 session.pending 数组
+    if (!targetCall) {
+      console.warn(`[Agent] ⚠️ messages 中未找到 interactiveId=${interactiveId}，尝试从 session 级别恢复...`)
+      const pendingList = await sessionRepo.getPendingInteractiveList(sessionId)
+      const pending = pendingList.find((p) => p.id === interactiveId)
+      if (pending) {
+        targetCall = { id: pending.id, name: pending.name, arguments: pending.arguments }
+        console.info(`[Agent] ✅ 从 session.pending_interactive 恢复：${pending.id}`)
+      } else if (pendingList.length > 0) {
+        throw new Error(
+          `会话 ${sessionId} 当前待回答的是另一组交互（${pendingList.map((p) => p.id).join(', ')}），与请求的 ${interactiveId} 不一致。可能使用了旧的 interactiveId。`,
+        )
+      }
+    }
+
+    // P0-3 修复：找到 targetCall 后立即校验 choice
     if (!targetCall) {
       throw new Error(`未找到 interactiveId=${interactiveId} 对应的工具调用，会话 ${sessionId} 可能已过期`)
     }
@@ -680,114 +937,123 @@ export class CookingAgent {
       throw new Error(`工具 ${targetCall.name} 不是交互式工具，无法用 resumeInteractive 恢复`)
     }
 
-    // 3. 追加 tool 消息（这是 LLM 期待的工具结果）
-    const toolResultMsg: Message = {
-      role: 'tool',
-      tool_call_id: interactiveId,
-      content: JSON.stringify({ user_choice: choice }),
+    // 解析 + 校验 choice
+    const originalRequest = parseInteractiveArgs(targetCall.id, targetCall.arguments)
+    let isSkip = false
+    if (originalRequest) {
+      try {
+        validateChoice(choice, originalRequest)
+      } catch (err) {
+        throw err
+      }
+      isSkip = choice.length === 1 && choice[0] === SKIP_SENTINEL
+    } else {
+      isSkip = choice.length === 1 && choice[0] === SKIP_SENTINEL
+      if (!isSkip) {
+        throw new Error(`会话 ${sessionId} 的交互式工具参数已损坏，无法校验选择`)
+      }
     }
-    messages.push(toolResultMsg)
-    await this.persistMessage(sessionId, toolResultMsg)
 
-    // 4. 继续 ReAct 循环 —— 复用 chatStream 主体逻辑
-    let fullContent = ''
-    let totalToolCalls = 0
-    let cancelled = false
-    let paused = false
-    const reactLog: ReActStep[] = []
+    // P1-7：记录用户选择到 history 表
+    if (!isSkip && originalRequest && originalRequest.category) {
+      try {
+        const now = Date.now()
+        for (const opt of choice) {
+          await choiceRepo.insert({
+            session_id: sessionId,
+            question: originalRequest.question,
+            category: originalRequest.category,
+            option: opt,
+            chosen_at: now,
+          })
+        }
+        console.info(`[Agent] 📝 已记录选择历史 [${sessionId}]：${originalRequest.category} → ${choice.join(', ')}`)
+      } catch (err) {
+        console.warn(`[Agent] ⚠️ 记录选择历史失败（不影响主流程）：`, (err as Error).message)
+      }
+    }
 
+    // P0-2 修复：从 pending 数组中移除本条
     try {
-      for (let step = 1; step <= MAX_REACT_STEPS; step++) {
-        if (signal?.aborted) {
-          cancelled = true
-          break
-        }
-
-        console.info(`[Agent] 🧠 恢复后 ReAct 推理第 ${step} 步...`)
-        const response = await this.callLLMWithRetry(messages)
-        const assistantContent = response.content
-        const assistantToolCalls = response.tool_calls
-
-        if (assistantToolCalls && assistantToolCalls.length > 0) {
-          const result = await this.handleToolCalls(
-            messages, sessionId, assistantContent, assistantToolCalls, reactLog, step,
-            onInteractive,
-          )
-          totalToolCalls += result.toolCount
-          if (result.paused) {
-            paused = true
-            console.info('[Agent] ⏸️  恢复后又遇到交互式工具，再次暂停')
-            break
-          }
-        } else {
-          console.info(`[Agent] 🔄 恢复后 LLM 返回最终回答，进入流式输出阶段`)
-          await this.llm.chatCompletionStream(
-            {
-              messages: messages as any,
-              temperature: 0.7,
-              max_tokens: 2048,
-            },
-            (chunk) => {
-              fullContent += chunk
-              onChunk(chunk)
-            },
-            () => {
-              console.info(`[Agent] ✅ 恢复后的流式回答完成（${fullContent.length} 字符）`)
-            },
-            (err) => {
-              console.error(`[Agent] ❌ 恢复后的流式回答出错：${err.message}`)
-            },
-            signal,
-          )
-
-          if (signal?.aborted) {
-            cancelled = true
-          }
-          break
-        }
-      }
-
-      // ── 中止处理 ──
-      if (cancelled) {
-        if (fullContent.length > 0) {
-          fullContent += '\n\n[已中止]'
-        } else {
-          fullContent = '请求已被中断，请重试。'
-        }
-        const partialMsg: Message = { role: 'assistant', content: fullContent }
-        messages.push(partialMsg)
-        await this.persistMessage(sessionId, partialMsg)
-        onDone(fullContent)
-        return
-      }
-
-      // ── 再次暂停（用户被问了第二个问题） ──
-      if (paused) {
-        this.logReActSummary(reactLog, totalToolCalls)
-        console.info(`[Agent] ⏸️  恢复后再次暂停 [${sessionId}]，等待用户继续选择`)
-        return
-      }
-
-      // ── 空回答兜底 ──
-      if (fullContent.length === 0) {
-        const fallback = '抱歉，我已经尽力思考了。请换个更具体的问题试试。'
-        const fallbackMsg: Message = { role: 'assistant', content: fallback }
-        messages.push(fallbackMsg)
-        await this.persistMessage(sessionId, fallbackMsg)
-        onDone(fallback)
-        return
-      }
-
-      // ── 正常完成 ──
-      const answerMsg: Message = { role: 'assistant', content: fullContent }
-      messages.push(answerMsg)
-      await this.persistMessage(sessionId, answerMsg)
-      this.logReActSummary(reactLog, totalToolCalls)
-      console.info(`[Agent] ✅ 恢复后的流式对话已完成 [${sessionId}]（${fullContent.length} 字符）`)
-      onDone(fullContent)
-    } catch (error) {
-      console.error(`[Agent] ❌ 恢复阶段失败 [${sessionId}]：${(error as Error).message}`)
-      throw error
+      await sessionRepo.removePendingInteractive(sessionId, interactiveId, Date.now())
+    } catch (err) {
+      console.warn(`[Agent] ⚠️ 移除 pending_interactive 失败（不影响主流程）：`, (err as Error).message)
     }
+
+    // 3. 更新占位 tool 消息（不是追加！）
+    //
+    // P-修复：handleToolCalls 已经为每个交互式 tool_call_id 写了一条"占位"tool 消息。
+    // 现在用户做出选择后，必须 UPDATE 已有占位消息的 content 为最终选择结果，
+    // 严格保持 assistant(tool_calls) 与 tool 消息的 1对1 关系（OpenAI 协议要求）。
+    //
+    // 兜底：若占位消息不存在（异常路径，比如 cleanup 已经把它 update 为 timeout，
+    // 或者历史脏数据），则插入新 tool 消息并以 messages 数组中的占位消息为锚点。
+    const now = Date.now()
+    const newContent = isSkip
+      ? JSON.stringify({ user_choice: null, skipped: true, hint: '用户未提供选择，请自行决定最合适的方案' })
+      : JSON.stringify({ user_choice: choice })
+
+    const updated = await messageRepo.updateToolContentByCallId(
+      sessionId,
+      interactiveId,
+      newContent,
+      now,
+    )
+
+    if (updated > 0) {
+      // 同步更新内存中的 messages 数组
+      const targetIdx = messages.findIndex(
+        (m) => m.role === 'tool' && m.tool_call_id === interactiveId,
+      )
+      if (targetIdx >= 0) {
+        messages[targetIdx] = { ...messages[targetIdx], content: newContent }
+      }
+      console.info(`[Agent] 🔄 [fix] 更新占位 tool 消息为最终选择：${interactiveId}`)
+    } else {
+      // 兜底：占位消息不存在 → 插入新 tool 消息
+      const toolResultMsg: Message = {
+        role: 'tool',
+        tool_call_id: interactiveId,
+        content: newContent,
+      }
+      messages.push(toolResultMsg)
+      await this.persistMessage(sessionId, toolResultMsg)
+      console.warn(
+        `[Agent] ⚠️ [fix] 占位 tool 消息不存在（已 insert 兜底）：${interactiveId}`,
+      )
+    }
+
+    // 4. 继续 ReAct 循环 —— 复用 runReActLoop
+    const outcome = await runReActLoop(messages, {
+      callLLM: (m) => this.callLLMWithRetry(m),
+      streamLLM: (m, onC, onD, onE, sig) =>
+        this.llm.chatCompletionStream(
+          { messages: m as any, temperature: 0.7, max_tokens: 2048 },
+          (chunk) => {
+            onC(chunk)
+            onChunk(chunk)
+          },
+          onD,
+          onE,
+          sig,
+        ),
+      handleTools: (assistantContent, toolCalls, step) =>
+        this.handleToolCalls(
+          messages, sessionId, assistantContent, toolCalls, [], step, onInteractive,
+        ).then((r) => ({ toolCount: r.toolCount, paused: r.paused })),
+      onInteractive,
+      onProgress,
+      signal,
+      maxSteps: MAX_REACT_STEPS,
+      logTag: '恢复后stream',
+    })
+
+    await finalize(this.toFinalizeOutcome(outcome), {
+      messages,
+      sessionId,
+      onDone,
+      persist: (sid, msg) => this.persistMessage(sid, msg),
+      logTag: '恢复后stream',
+    })
   }
 }

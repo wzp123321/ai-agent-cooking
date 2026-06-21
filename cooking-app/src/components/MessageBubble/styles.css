@@ -1,0 +1,425 @@
+/**
+ * MessageBubble — 共享样式
+ *
+ * 设计原则：
+ *   - 主组件 (index.vue) 提供 flex 布局和气泡外壳
+ *   - 子组件各自负责自己的内容样式
+ *   - 此文件统一管理 5 个子组件共享的样式 + 动画
+ */
+
+/* ═══ 消息行布局 ═══ */
+.message {
+  display: flex;
+  gap: clamp(10px, 2vw, 14px);
+  animation: messageSlideIn var(--duration-slow) var(--ease-out-back) both;
+  max-width: min(860px, 100%);
+  /**
+   * CSS 虚拟滚动 — content-visibility: auto
+   *
+   * 原理：浏览器跳过视口外元素的渲染（paint + layout），
+   *      仅在元素接近视口时才渲染。对 DOM 树本身无影响，
+   *      因此 v-for 不需要修改。
+   *
+   * contain-intrinsic-size 提供预估高度，防止滚动条跳动。
+   * 每条消息大约 80-300px，取 120px 作为估算基准。
+   *
+   * 兼容性：Chrome 85+, Edge 85+。Firefox 不支持但会忽略。
+   */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
+}
+
+.message.user {
+  flex-direction: row-reverse;
+  margin-inline-start: auto;
+}
+
+@keyframes messageSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(16px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ═══ 头像 (MessageAvatar) ═══ */
+.avatar {
+  --avatar-size: clamp(34px, 5vw, 40px);
+  width: var(--avatar-size);
+  height: var(--avatar-size);
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  align-self: flex-end;
+  position: relative;
+  transition:
+    transform var(--duration-fast) var(--ease-out-back),
+    box-shadow var(--duration-fast) var(--ease-out-expo);
+}
+
+.avatar-icon {
+  width: 52%;
+  height: 52%;
+}
+
+.user-avatar {
+  background: linear-gradient(145deg, #f0a030, #e88a1a);
+  color: #fff;
+  box-shadow:
+    0 2px 8px rgba(232, 138, 26, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.assistant-avatar {
+  background: linear-gradient(145deg, #f5f3ef, #eae7e0);
+  color: var(--accent-cool);
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.avatar-pulse {
+  position: absolute;
+  inset: -3px;
+  border-radius: inherit;
+  border: 2px solid var(--accent);
+  opacity: 0;
+  animation: avatarPulse 2s ease-in-out infinite;
+}
+
+@keyframes avatarPulse {
+  0%, 100% { opacity: 0; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(1.08); }
+}
+
+/* ═══ 气泡 (主组件) ═══ */
+.bubble-wrapper {
+  max-width: calc(100% - var(--avatar-size) - clamp(10px, 2vw, 14px));
+  display: flex;
+  flex-direction: column;
+}
+
+.bubble {
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  line-height: 1.72;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  transition:
+    box-shadow var(--duration-fast) var(--ease-out-expo),
+    border-color var(--duration-fast) var(--ease-out-expo);
+  position: relative;
+}
+
+.bubble.user {
+  background: linear-gradient(145deg, #f0a030, #e07b1e);
+  color: #fff;
+  border-end-end-radius: 5px;
+  box-shadow: 0 4px 16px rgba(232, 138, 26, 0.2);
+}
+
+.bubble.assistant {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-end-start-radius: 5px;
+  box-shadow: var(--shadow-xs);
+}
+
+.bubble.assistant:hover {
+  border-color: var(--border-light);
+}
+
+.bubble.assistant.thinking {
+  border-color: var(--border-accent);
+  background: linear-gradient(145deg, #fffefb, #faf8f4);
+  box-shadow: 0 0 20px rgba(232, 138, 26, 0.06);
+}
+
+.user-image {
+  max-width: 240px;
+  max-height: 240px;
+  border-radius: var(--radius-xs);
+  object-fit: cover;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.user-text {
+  word-break: break-word;
+}
+
+/* ═══ 工具调用卡片 (ToolCallList) ═══ */
+/**
+ *   - 卡片：圆角 + 浅灰背景 + 细边框，与气泡形成视觉分层
+ *   - 头部：横向 flex，左侧图标 / 中间名+参数 / 右侧折叠箭头
+ *   - 折叠态：仅显示一行；展开态：pre 块展示完整参数
+ */
+.tool-calls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tool-call {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft, rgba(0, 0, 0, 0.03));
+  overflow: hidden;
+  transition: border-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.tool-call.is-streaming {
+  border-color: var(--accent);
+  animation: toolPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes toolPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.15); }
+}
+
+.tool-call-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.tool-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.tool-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--accent);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+}
+
+.tool-summary {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-streaming {
+  flex: 1;
+  font-size: 12px;
+  color: var(--accent);
+  font-style: italic;
+}
+
+.tool-toggle {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.tool-args {
+  margin: 0;
+  padding: 8px 12px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text);
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow: auto;
+}
+
+/* ═══ 思考中动画 (ThinkingDots) ═══ */
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.thinking-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+
+.thinking-dots {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.thinking-dots .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.4;
+  animation: dotBounce 1.4s ease-in-out infinite;
+}
+
+.thinking-dots .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.thinking-dots .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes dotBounce {
+  0%, 80%, 100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 0.9;
+    transform: translateY(-5px);
+  }
+}
+
+/* ═══ Markdown 渲染 (MarkdownContent) ═══ */
+.markdown-body {
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 16px 0 8px;
+  letter-spacing: -0.01em;
+}
+
+.markdown-body h1 { font-size: 1.4em; }
+.markdown-body h2 {
+  font-size: 1.2em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+.markdown-body h3 { font-size: 1.05em; }
+
+.markdown-body code {
+  background: var(--bg-elevated);
+  color: var(--accent-light);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.markdown-body pre {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 10px 0;
+}
+
+.markdown-body pre code {
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 0;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-inline-start: 20px;
+  margin: 6px 0;
+}
+
+.markdown-body li { margin: 3px 0; }
+
+.markdown-body p { margin: 6px 0; }
+
+.markdown-body strong {
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid var(--accent);
+  padding: 4px 14px;
+  margin: 10px 0;
+  color: var(--text-secondary);
+  background: var(--accent-soft);
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 0.9em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.markdown-body th {
+  background: var(--bg-elevated);
+  font-weight: 600;
+}
+
+.markdown-body tr:nth-child(even) {
+  background: rgba(0, 0, 0, 0.015);
+}
+
+.markdown-body a {
+  color: var(--accent-light);
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
+}
+
+/* ═══ 输入光标 (MarkdownContent) ═══ */
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.15em;
+  background: linear-gradient(to bottom, var(--accent), var(--accent-light));
+  margin-inline-start: 3px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  animation: cursorBlink 0.7s step-end infinite;
+}
+
+@keyframes cursorBlink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0; }
+}
+
+/* ═══ 响应式 ═══ */
+@media (width < 640px) {
+  .bubble {
+    padding: 10px 14px;
+  }
+}

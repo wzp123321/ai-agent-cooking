@@ -1,6 +1,8 @@
 # Agent 开发指南
 
 > 基于 cooking-agent 项目的实战总结，涵盖 ReAct 推理、Function Calling、Skill 系统、工具开发、会话持久化等 Agent 开发全流程。
+>
+> **配套深度文档**：[interactive-dialogue-deep-dive.md](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/interactive-dialogue-deep-dive.md) — 交互式对话的 12 个底层原理（OpenAI 协议约束 / 顺序敏感性 / 边界场景）
 
 ---
 
@@ -12,6 +14,7 @@
 4. [工具体系设计](#4-工具体系设计)
    - 4.5 交互式工具（人机协作）
    - 4.6 续点机制：resumeInteractive
+   > 📘 深入实现：参见 [interactive-dialogue-deep-dive.md](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/interactive-dialogue-deep-dive.md) §1-§5（OpenAI 协议约束 / `INTERACTIVE_TOOL_NAMES` 设计 / `handleToolCalls` 顺序敏感性）
 5. [Skill 系统（Markdown 驱动）](#5-skill-系统markdown-驱动)
 6. [Prompt 工程](#6-prompt-工程)
 7. [会话与消息持久化](#7-会话与消息持久化)
@@ -486,6 +489,8 @@ private parseInteractiveArgs(id: string, argsStr: string): InteractiveRequest | 
 
 用户提交选项后，前端调用 `POST /api/chat/continue` → `agent.resumeInteractive()` 恢复 ReAct 循环。
 
+> 📘 **深入原理**：本节仅展示 happy path，5 个边界场景（OpenAI 协议约束、`targetCall` 展平、上下文截断影响、AbortSignal 重置、多交互并发）请参见 [interactive-dialogue-deep-dive.md §1-§9](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/interactive-dialogue-deep-dive.md)。
+
 #### 4.6.1 完整流程
 
 ```
@@ -841,6 +846,10 @@ if (isFirstUserMessage) {
  * @param onInteractive — 交互式工具触发回调（可选，接收 InteractiveRequest）
  *                        LLM 调起 ask_user_choice 时触发，调用方应通过 SSE 下发到前端
  *                        并结束本轮（不调 onDone），等 /api/chat/continue 端点接管
+ * @param onProgress    — ReAct 阶段进度回调（可选，P1 新增）
+ *                        4 种事件：thinking / tool_call / tool_result / streaming
+ *                        调用方应通过 SSE `progress` 事件下发，前端用它渲染
+ *                        "🧠 正在推理第 1 步" / "🔧 正在调用 search_recipe" 指示器
  */
 async chatStream(
   userMessage: string,
@@ -849,6 +858,7 @@ async chatStream(
   onDone: (fullContent: string) => void,
   signal?: AbortSignal,
   onInteractive?: (req: InteractiveRequest) => void,
+  onProgress?: (event: ReActProgressEvent) => void,  // ← P1 新增
 ): Promise<void> {
   const messages = await this.loadMessages(sessionId)
   await this.prependUserMessage(messages, sessionId, userMessage)
@@ -863,22 +873,39 @@ async chatStream(
     for (let step = 1; step <= MAX_REACT_STEPS; step++) {
       if (signal?.aborted) { cancelled = true; break }
 
+      // P1：上报"开始第 N 步推理"，前端渲染 "🧠 正在推理第 N / 5 步…"
+      onProgress?.({ type: 'thinking', step, maxSteps: MAX_REACT_STEPS })
+
       const response = await this.callLLMWithRetry(messages)
       const assistantContent = response.content
       const assistantToolCalls = response.tool_calls
 
       if (assistantToolCalls && assistantToolCalls.length > 0) {
+        // P1：上报"即将调用 XX 工具"
+        onProgress?.({
+          type: 'tool_call',
+          step,
+          toolNames: assistantToolCalls.map(tc => tc.function.name).filter(Boolean),
+        })
+
         // 工具调用阶段：非流式，内部拆分流（普通 vs 交互式）
         const result = await this.handleToolCalls(
           messages, sessionId, assistantContent, assistantToolCalls, reactLog, step, onInteractive,
         )
         totalToolCalls += result.toolCount
+
+        // P1：上报"工具执行完成 N 个结果"
+        onProgress?.({ type: 'tool_result', step, count: result.toolCount })
+
         if (result.paused) {
           // 交互式工具触发 → 跳出循环，等待 resumeInteractive
           paused = true
           break
         }
       } else {
+        // P1：上报"进入流式回答阶段"
+        onProgress?.({ type: 'streaming', step })
+
         // 最终回答阶段：流式输出
         await this.llm.chatCompletionStream(
           { messages: messages as any, temperature: 0.7, max_tokens: 2048 },
@@ -922,6 +949,63 @@ async chatStream(
 }
 ```
 
+#### 8.2.1 P1 — ReAct 阶段进度上报（progress 事件）
+
+`onProgress` 是 P1 性能优化新增的回调，让前端在 ReAct 黑盒期能感知 Agent 在做什么。事件类型定义在 [react-loop.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/agent/react-loop.ts)：
+
+```typescript
+export type ReActProgressEvent =
+  | { type: 'thinking'; step: number; maxSteps: number }
+  | { type: 'tool_call'; step: number; toolNames: string[] }
+  | { type: 'tool_result'; step: number; count: number }
+  | { type: 'streaming'; step: number }
+```
+
+SSE 路由层（[chat.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/routes/chat.ts)）在 `index.ts` 端点把回调转成 SSE 事件下发：
+
+```typescript
+await agent.chatStream(
+  message, sessionId,
+  (chunk) => sendSSEEvent(res, 'chunk', { content: chunk }),
+  (full) => sendSSEEvent(res, 'done', { content: full, sessionId }),
+  abortController.signal,
+  (req) => {
+    sendSSEEvent(res, 'interactive_request', req)
+    res.end()  // 交互式工具触发后主动断开，等 /api/chat/continue
+  },
+  // P1：把 progress 事件原样转成 SSE progress
+  (event) => sendSSEEvent(res, 'progress', event),
+)
+```
+
+前端 [api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts) 解析 `progress` 事件后通过 `useReActProgress` 模块级 ref 暴露给 UI；[ReActProgressIndicator.vue](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/components/MessageBubble/ReActProgressIndicator.vue) 在 `streaming` 状态下显示 "🧠 正在推理第 N 步…" / "🔧 正在调用 XX…"。完整说明参见 [streaming-guide.md](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/views/streaming-guide.md) §7.1 与 §9。
+
+#### 8.2.2 P1 — 服务端 SSE 心跳（`:heartbeat` 注释行）
+
+[http/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/src/http/sse.ts) 在 SSE 连接创建后启动一个 15s 周期的 `setInterval`，向客户端写入 SSE 注释行（`:heartbeat\n\n`）：
+
+```typescript
+const HEARTBEAT_INTERVAL_MS = 15_000
+const heartbeatTimer = setInterval(() => {
+  if (finished || res.writableEnded) {
+    clearInterval(heartbeatTimer)
+    return
+  }
+  try {
+    res.write(':heartbeat\n\n')  // SSE 注释行：EventSource 忽略，TCP 探针能识别
+  } catch (err) {
+    clearInterval(heartbeatTimer)
+  }
+}, HEARTBEAT_INTERVAL_MS)
+```
+
+前端 [api/sse.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/api/sse.ts) 的消费器遇到 `line.startsWith(':')` 时跳过数据组装，转调 `onHeartbeat`，由 [useStreamEvents.ts](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/hooks/conversation/useStreamEvents.ts) 重置 30s 静默计时器。这解决了长 ReAct（30s+ 无业务事件）时前端误判"卡住"的问题。
+
+**注意**：
+- `setInterval` 必须在 `markFinished()` / 连接 `close` / `error` 时 `clearInterval`，否则会内存泄漏或在已关闭的 socket 上写崩溃。
+- 注释行是 SSE 协议规定的标准保活机制，与 nginx/proxy 的 `proxy_read_timeout` 配合使用（默认 60s，15s 心跳间隔能保证）。
+- 前端 EventSource 自动忽略 `:` 开头的行（这是 SSE 规范要求），但 `fetch + ReadableStream` 手写消费器必须自己实现跳过逻辑。
+
 ### 8.3 中止信号集成
 
 从 index.ts 的 SSE 端点通过 `signal?: AbortSignal` 参数传入，沿以下路径传播：
@@ -953,7 +1037,7 @@ index.ts AbortController
 - **流式完成后持久化**：`onDone` 回调中将完整内容写入磁盘
 - **`for await` 遍历流**：使用 `for await (const chunk of stream)` 消费 OpenAI 的 SSE 流
 - **delta 可能为空**：某些 chunk 不含 content（如含 usage 信息），需要判空
-- **中止信号守卫**：SSE 端点的 `req.on('close')` 极易误触发，通过 `finished` / `hasStreamed` / `writableEnded` 三标记精确判断，参见 [streaming-guide.md](file:///e:/workspace/private/ai-agent-cooking/cooking-app/src/views/streaming-guide.md) §6.4
+- **中止信号守卫**：SSE 端点的 `req.on('close')` 极易误触发，通过 `finished` / `hasStreamed` / `writableEnded` 三标记精确判断，参见 [streaming-guide.md](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/views/streaming-guide.md) §6.4
 - **暂停时不调 `onDone`**：交互式工具触发后 `paused=true`，调用方（index.ts）应主动 `res.end()`，等 `/api/chat/continue` 端点接手
 
 ### 8.5 交互式工具的暂停与续点

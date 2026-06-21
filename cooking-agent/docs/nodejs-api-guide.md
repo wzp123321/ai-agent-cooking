@@ -1,6 +1,8 @@
 # Node.js 接口开发指南
 
 > 基于 cooking-agent 项目的实战总结，涵盖 Express + TypeScript + SQLite 技术栈的接口开发全流程。
+>
+> **配套深度文档**：[interactive-dialogue-deep-dive.md §12](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/interactive-dialogue-deep-dive.md) — SSE 三标记守卫的状态机详解（`finished` / `hasStreamed` / `writableEnded` 的精确分工与避坑指南）
 
 ---
 

@@ -53,6 +53,16 @@ GET    /api/history/:id    获取对话历史
 DELETE /api/session/:id   清除会话
 ```
 
+## P1 性能优化
+
+| 优化项 | 实现位置 | 说明 |
+|--------|---------|------|
+| **ReAct 进度事件** | `src/agent.ts` 中 `chatStream` / `resumeInteractive` 新增 `onProgress` 回调 | 4 种类型（`thinking` / `tool_call` / `tool_result` / `streaming`），通过 SSE `progress` 事件下发到前端 |
+| **SSE 心跳保活** | `src/http/sse.ts` | `setInterval` 每 15s 写一条 `:heartbeat\n\n` 注释行，防止长 ReAct（30s+）被 nginx `proxy_read_timeout` 切断 |
+| **3 标记守卫** | `src/http/sse.ts` | `finished` / `writableEnded` / `hasStreamed` 三重检查，准确区分用户中止 vs 网络抖动 |
+
+详细设计见 [docs/agent-dev-guide.md §8.2.1-§8.2.2](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-agent/docs/agent-dev-guide.md) 与 [cooking-app/streaming-guide.md §9](file:///e:/workspace/private/ai-agent-cooking-sse/cooking-app/src/views/streaming-guide.md)。
+
 ## 启动
 
 ```bash

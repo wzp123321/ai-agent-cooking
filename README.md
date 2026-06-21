@@ -73,6 +73,9 @@ cooking-ai/
 | 🤖 **真正的 Agent**  | ReAct 推理循环 + Function Calling                      |
 | 🔧 **7 大工具**      | 菜谱 / 营养 / 安全 / 技法 / 推荐 / 食材替换 / 膳食适配 |
 | ⚡ **流式响应**      | SSE 打字机效果                                         |
+| 🧠 **ReAct 进度反馈** | 实时显示 "🧠 正在推理第 N 步" / "🔧 正在调用 XX" 指示器（P1） |
+| 💓 **SSE 心跳保活**  | 15s 心跳注释行，长 ReAct 不被 nginx 切断（P1）        |
+| 🔁 **断连自动重连**  | 指数退避 1s→2s→4s 最多 3 次，弱网/移动端无感恢复（P1） |
 | 💬 **多轮对话**      | Session 级别记忆 + 历史持久化                          |
 | 📱 **响应式**        | 移动端适配                                             |
 | 🔄 **LLM 重试**      | 指数退避自动重试（最多 3 次）                          |
@@ -80,7 +83,7 @@ cooking-ai/
 | 👤 **用户画像**      | 过敏食材 / 膳食模式 / 烹饪水平偏好                     |
 | 📚 **RAG 知识库**    | TF-IDF 检索增强生成                                    |
 | 🔌 **多模型支持**    | DeepSeek / OpenAI 可切换                               |
-| 🎨 **Markdown 渲染** | AI 回复支持富文本展示                                  |
+| 🎨 **Markdown 渲染** | AI 回复支持富文本 + Mermaid 图表 + KaTeX 公式          |
 | ⌨️ **快捷键**        | Ctrl+N 新建对话                                        |
 
 ## 快速启动
@@ -121,3 +124,7 @@ npm run dev   # 访问 http://localhost:5173
 **后端**：`TypeScript` + `Node.js` + `Express` + `OpenAI SDK` + `better-sqlite3`
 
 **前端**：`Vue 3` + `Vite` + `Pinia` + `Vue Router` + `TypeScript` + `Element Plus` + `Axios` + `marked`
+
+## 更新日志
+
+完整功能迭代、性能优化、Bug 修复记录见 [CHANGELOG.md](file:///e:/workspace/private/ai-agent-cooking-sse/CHANGELOG.md)。

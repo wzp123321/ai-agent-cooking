@@ -19,7 +19,7 @@
 import { inject } from 'vue'
 import { useChatStore } from '@/stores/chat'
 import { useScrollToBottom } from '@/hooks/useScrollToBottom'
-import MessageBubble from '@/components/MessageBubble.vue'
+import MessageBubble from '@/components/MessageBubble/index.vue'
 import WelcomeScreen from '@/components/WelcomeScreen.vue'
 
 const chatStore = useChatStore()

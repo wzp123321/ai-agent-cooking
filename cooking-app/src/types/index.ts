@@ -24,11 +24,37 @@ export interface ChatMessage {
   interactiveResolved?: boolean
 }
 
+/** 交互类型（与后端 constants.ts 的 INTERACTIVE_TYPES 保持一致） */
+export type InteractiveType = 'choice' | 'text' | 'confirm' | 'slider'
+
+/** text 输入的额外元数据（来自后端 meta） */
+export interface InteractiveTextMeta {
+  placeholder?: string
+  maxLength?: number
+}
+
+/** slider 输入的额外元数据（来自后端 meta） */
+export interface InteractiveSliderMeta {
+  min: number
+  max: number
+  step?: number
+  default?: number
+  unit?: string
+}
+
+/** 答案有效性约束（来自后端 validation） */
+export interface InteractiveValidation {
+  regex?: string
+  minLength?: number
+  maxLength?: number
+}
+
 /**
  * 交互式工具请求
  *
  * 由后端在 LLM 调起 ask_user_choice 时下发，
- * 前端把它渲染为按钮组（单选）/复选框组（多选）。
+ * 前端按 `type` 字段分支渲染：choice→按钮/复选框、text→输入框、
+ * confirm→确认/取消、slider→滑动条。
  *
  * id 与 LLM 下发的 tool_call.id 一一对应，
  * 用户选择回传时也带此 id。
@@ -37,8 +63,18 @@ export interface InteractiveRequest {
   id: string
   question: string
   options: string[]
-  /** true=多选（复选框）；false=单选（按钮组） */
+  /** true=多选（复选框）；false=单选（按钮组）；text/confirm/slider 模式下忽略 */
   multiSelect: boolean
+  /** 交互类型（默认 choice，向前兼容旧 SSE 事件） */
+  type: InteractiveType
+  /** 类别（用于历史偏好聚合；可空） */
+  category?: string
+  /** 扩展参数（type 决定是否生效） */
+  meta: Record<string, unknown>
+  /** 选项配图（与 options 等长；null=无图）。仅 choice 模式使用 */
+  optionImages?: (string | null)[]
+  /** 答案有效性约束（仅 text 模式使用） */
+  validation?: InteractiveValidation
 }
 
 // ─── 会话类型 ─────────────────────────────────────────
@@ -82,6 +118,19 @@ export interface SSEDoneData {
 export interface SSEErrorData {
   error: string
 }
+
+/**
+ * P1-①：ReAct 阶段进度事件（与后端 ReActProgressEvent 镜像）。
+ *  - 'thinking'   : 开始第 N 轮推理
+ *  - 'tool_call'  : 即将执行工具（toolNames 列出所有工具）
+ *  - 'tool_result': 工具执行完成
+ *  - 'streaming'  : 进入流式回答阶段
+ */
+export type ReActProgressEvent =
+  | { type: 'thinking'; step: number; maxSteps: number }
+  | { type: 'tool_call'; step: number; toolNames: string[] }
+  | { type: 'tool_result'; step: number; count: number }
+  | { type: 'streaming'; step: number }
 
 // ─── 工具调用类型 ─────────────────────────────────────
 /**
